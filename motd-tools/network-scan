@@ -1,0 +1,591 @@
+#!/bin/bash
+#
+# network-scan - Display network scan results (reads from cache by default)
+#
+# Usage:
+#   network-scan          # Quick summary from cache
+#   network-scan -v       # Verbose: show new devices with details
+#   network-scan -a       # All: show all devices (known + new)
+#   network-scan -f       # Full: all devices + weather/external info
+#   network-scan -q       # Quiet: just the count number
+#   network-scan --live   # Force a fresh scan (bypass cache)
+#   network-scan --list   # List all known devices from history
+#   network-scan --forget MAC  # Forget a device
+#   network-scan --forget-all  # Reset device history
+#   network-scan --log    # Show recent scan log
+#
+
+set -euo pipefail
+
+# Always report presence of a specific device in the verbose report
+TRACKED_DEVICE_LABEL="Redmi Note 12 Pro 5G"
+TRACKED_DEVICE_PATTERNS=("redmi note 12 pro 5g" "redmi note 12 pro 5" "redmi")
+
+# Always report whether the tracked device is present in the scan cache.
+tracked_device_present() {
+    local cache_json="$1"
+    [[ -z "$cache_json" ]] && return 1
+
+    local devices
+    devices=$(echo "$cache_json" | grep -o '"devices":[[:space:]]*\[.*\]' | sed 's/"devices":[[:space:]]*\[//' | sed 's/\]$//')
+    [[ -z "$devices" ]] && return 1
+
+    local device
+    while IFS= read -r device; do
+        [[ -z "$device" ]] && continue
+
+        local display_name
+        display_name=$(echo "$device" | grep -o '"display_name":"[^"]*"' | cut -d'"' -f4 | tr '[:upper:]' '[:lower:]')
+
+        local hostname
+        hostname=$(echo "$device" | grep -o '"hostname":"[^"]*"' | cut -d'"' -f4 | tr '[:upper:]' '[:lower:]')
+
+        local haystack="${display_name} ${hostname}"
+        local pat
+        for pat in "${TRACKED_DEVICE_PATTERNS[@]}"; do
+            if [[ "$haystack" == *"$pat"* ]]; then
+                return 0
+            fi
+        done
+    done < <(echo "$devices" | tr '}' '\n')
+
+    return 1
+}
+
+print_tracked_device_line() {
+    local cache_json="$1"
+
+    local msg
+    local color
+    if tracked_device_present "$cache_json"; then
+        color="$GREEN"
+        msg="PRESENT"
+    else
+        color="$RED"
+        msg="ABSENT"
+    fi
+
+    echo -e "${BOLD}${CYAN}║${NC} ${BOLD}📱 ${TRACKED_DEVICE_LABEL}:${NC} ${color}${BOLD}${msg}${NC}$(printf '%*s' $((43 - ${#TRACKED_DEVICE_LABEL} - ${#msg})) '')${BOLD}${CYAN}║${NC}"
+}
+
+
+# Configuration - load from config file
+CONFIG_FILE="${HOME}/bin/config/router.conf"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+    NETWORK=$(grep -E "^network\s*=" "$CONFIG_FILE" | cut -d'=' -f2 | tr -d ' ' || echo "192.168.0.0/24")
+    INTERFACE=$(grep -E "^interface\s*=" "$CONFIG_FILE" | cut -d'=' -f2 | tr -d ' ' || echo "eth0")
+    MY_IP=$(grep -E "^my_ip\s*=" "$CONFIG_FILE" | cut -d'=' -f2 | tr -d ' ' || echo "")
+else
+    echo "Warning: Config file not found: $CONFIG_FILE" >&2
+    echo "Using defaults. Copy router.conf.example to router.conf" >&2
+    NETWORK="192.168.0.0/24"
+    INTERFACE="eth0"
+    MY_IP=""
+fi
+
+# Paths
+DATA_DIR="${HOME}/.local/share/network-scan"
+CACHE_FILE="${DATA_DIR}/scan_cache.json"
+HISTORY_FILE="${DATA_DIR}/device_history.db"
+NAMES_FILE="${DATA_DIR}/device_names.db"
+LOG_FILE="${DATA_DIR}/scan.log"
+
+# Settings
+KNOWN_THRESHOLD=3
+HISTORY_DAYS=30
+CACHE_MAX_AGE=3600  # Consider cache stale after 1 hour
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m'
+BOLD='\033[1m'
+DIM='\033[2m'
+
+# Parse arguments
+VERBOSE=false
+QUIET=false
+FULL=false
+SHOW_ALL=false
+LIVE_SCAN=false
+LIST_KNOWN=false
+SHOW_LOG=false
+NAME_MAC=""
+NAME_VALUE=""
+FORGET_MAC=""
+FORGET_ALL=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -q|--quiet)
+            QUIET=true
+            shift
+            ;;
+        -f|--full)
+            FULL=true
+            VERBOSE=true
+            SHOW_ALL=true
+            shift
+            ;;
+        -a|--all)
+            SHOW_ALL=true
+            VERBOSE=true
+            shift
+            ;;
+        --live)
+            LIVE_SCAN=true
+            shift
+            ;;
+        --list)
+            LIST_KNOWN=true
+            shift
+            ;;
+        --log)
+            SHOW_LOG=true
+            shift
+            ;;
+        --name)
+            NAME_MAC="$2"
+            NAME_VALUE="$3"
+            shift 3
+            ;;
+        --forget)
+            FORGET_MAC="$2"
+            shift 2
+            ;;
+        --forget-all)
+            FORGET_ALL=true
+            shift
+            ;;
+        -h|--help)
+            cat << 'EOF'
+Usage: network-scan [OPTIONS]
+
+Scan Options:
+  (default)      Quick summary from cached scan
+  -v, --verbose  Show new devices with full details
+  -a, --all      Show ALL devices (known + new)
+  -f, --full     Full report with weather and external info
+  -q, --quiet    Output only the device count number
+  --live         Force a fresh scan (bypass cache)
+
+Device Management:
+  --list         List all known devices from history
+  --forget MAC   Forget a specific device by MAC address
+  --forget-all   Reset all device history
+  --name MAC "Name"  Give a device a custom name
+  --log          Show recent scan log entries
+
+Background Scanning:
+  Scans run automatically every 30 minutes via cron.
+  Results are cached for instant display on SSH login.
+  Use --live to force an immediate fresh scan.
+
+A device is 'known' after being seen 3+ times in 30 days.
+Known devices are hidden by default - only NEW devices are shown.
+EOF
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+#=============================================================================
+# Helper Functions
+#=============================================================================
+
+mkdir -p "$DATA_DIR"
+
+# Get emoji for category
+get_category_emoji() {
+    case "$1" in
+        phone) echo "📱" ;;
+        laptop) echo "💻" ;;
+        desktop) echo "🖥️ " ;;
+        tv) echo "📺" ;;
+        printer) echo "🖨️ " ;;
+        speaker) echo "🔊" ;;
+        camera) echo "📷" ;;
+        router) echo "🌐" ;;
+        apple) echo "🍎" ;;
+        samsung) echo "📱" ;;
+        google) echo "🔍" ;;
+        amazon) echo "📦" ;;
+        raspberry) echo "🍓" ;;
+        computer) echo "💻" ;;
+        network) echo "🌐" ;;
+        iot) echo "💡" ;;
+        *) echo "❓" ;;
+    esac
+}
+
+# Format time ago
+time_ago() {
+    local timestamp="$1"
+    # Handle ISO 8601 format: 2025-12-21T20:48:24+01:00
+    local scan_epoch
+    # Try GNU date first, then BSD date
+    scan_epoch=$(date -d "$timestamp" +%s 2>/dev/null || echo "")
+    if [[ -z "$scan_epoch" ]]; then
+        scan_epoch=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo "0")
+    fi
+    local now_epoch=$(date +%s)
+    local diff=$((now_epoch - scan_epoch))
+    
+    if [[ $diff -lt 60 ]]; then
+        echo "just now"
+    elif [[ $diff -lt 3600 ]]; then
+        echo "$((diff / 60))m ago"
+    elif [[ $diff -lt 86400 ]]; then
+        echo "$((diff / 3600))h ago"
+    else
+        echo "$((diff / 86400))d ago"
+    fi
+}
+
+# Check if cache is stale
+is_cache_stale() {
+    if [[ ! -f "$CACHE_FILE" ]]; then
+        return 0  # No cache = stale
+    fi
+    
+    local file_age=$(($(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0)))
+    [[ $file_age -gt $CACHE_MAX_AGE ]]
+}
+
+# Parse JSON value (simple parser for our known format)
+json_value() {
+    local json="$1"
+    local key="$2"
+    local result
+    # Try string value first (with quotes)
+    result=$(echo "$json" | grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed 's/.*:[[:space:]]*"//' | sed 's/"$//' | head -1)
+    if [[ -n "$result" ]]; then
+        echo "$result"
+        return
+    fi
+    # Try numeric value (no quotes)
+    echo "$json" | grep -o "\"$key\"[[:space:]]*:[[:space:]]*[0-9]*" | sed 's/.*:[[:space:]]*//' | head -1
+}
+
+# Count recent visits for history display
+count_recent_visits() {
+    local visit_dates="$1"
+    local cutoff_date=$(date -d "-${HISTORY_DAYS} days" +%Y-%m-%d 2>/dev/null || date -v-${HISTORY_DAYS}d +%Y-%m-%d)
+    local count=0
+    
+    IFS=',' read -ra dates <<< "$visit_dates"
+    for d in "${dates[@]}"; do
+        if [[ "$d" > "$cutoff_date" || "$d" == "$cutoff_date" ]]; then
+            ((count++)) || true
+        fi
+    done
+    echo "$count"
+}
+
+#=============================================================================
+# Device Management Commands
+#=============================================================================
+
+# Handle --name command
+if [[ -n "$NAME_MAC" ]]; then
+    if [[ -z "$NAME_VALUE" ]]; then
+        echo -e "${RED}Error:${NC} Please provide a name. Usage: scan --name MAC \"Device Name\""
+        exit 1
+    fi
+    
+    mac=$(echo "$NAME_MAC" | tr '[:lower:]' '[:upper:]')
+    
+    # Initialize names file if needed
+    if [[ ! -f "$NAMES_FILE" ]]; then
+        echo "# Custom Device Names" > "$NAMES_FILE"
+        echo "# Format: MAC|CUSTOM_NAME" >> "$NAMES_FILE"
+    fi
+    
+    # Remove existing name for this MAC if any
+    if grep -qi "^${mac}|" "$NAMES_FILE" 2>/dev/null; then
+        tmp_file=$(mktemp)
+        grep -iv "^${mac}|" "$NAMES_FILE" > "$tmp_file"
+        mv "$tmp_file" "$NAMES_FILE"
+    fi
+    
+    # Add new name
+    echo "${mac}|${NAME_VALUE}" >> "$NAMES_FILE"
+    echo -e "${GREEN}✓${NC} Named device ${CYAN}$mac${NC} as ${BOLD}\"$NAME_VALUE\"${NC}"
+    echo -e "${DIM}Run 'scan --live' to refresh the display.${NC}"
+    exit 0
+fi
+
+if $LIST_KNOWN; then
+    if [[ ! -f "$HISTORY_FILE" ]]; then
+        echo "No device history yet. Run a scan first."
+        exit 0
+    fi
+    
+    echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}                         ${BOLD}📚 Known Device History${NC}                               ${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}╠════════════════════════════════════════════════════════════════════════════════╣${NC}"
+    printf "${BOLD}${CYAN}║${NC} %-17s %-15s %-20s %-10s %-10s ${BOLD}${CYAN}║${NC}\n" "MAC" "Last IP" "Hostname" "Visits" "Last Seen"
+    echo -e "${BOLD}${CYAN}╠════════════════════════════════════════════════════════════════════════════════╣${NC}"
+    
+    count=0
+    while IFS='|' read -r mac ip hostname vendor first_seen last_seen visit_dates; do
+        [[ "$mac" =~ ^#.*$ ]] && continue
+        [[ -z "$mac" ]] && continue
+        
+        recent_visits=$(count_recent_visits "$visit_dates")
+        if [[ $recent_visits -ge $KNOWN_THRESHOLD ]]; then
+            status="${GREEN}✓${NC}"
+        else
+            status="${YELLOW}?${NC}"
+        fi
+        
+        [[ ${#hostname} -gt 18 ]] && hostname="${hostname:0:15}..."
+        
+        printf "${BOLD}${CYAN}║${NC} $status %-17s %-15s %-20s %-10s %-10s ${BOLD}${CYAN}║${NC}\n" \
+            "$mac" "$ip" "${hostname:--}" "${recent_visits}/${KNOWN_THRESHOLD}" "$last_seen"
+        ((count++)) || true
+    done < "$HISTORY_FILE"
+    
+    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${DIM}Total: $count devices. ✓ = known (${KNOWN_THRESHOLD}+ visits), ? = learning${NC}"
+    exit 0
+fi
+
+if [[ -n "$FORGET_MAC" ]]; then
+    mac=$(echo "$FORGET_MAC" | tr '[:lower:]' '[:upper:]')
+    if [[ -f "$HISTORY_FILE" ]] && grep -qi "^${mac}|" "$HISTORY_FILE"; then
+        tmp_file=$(mktemp)
+        grep -iv "^${mac}|" "$HISTORY_FILE" > "$tmp_file"
+        mv "$tmp_file" "$HISTORY_FILE"
+        echo -e "${GREEN}✓${NC} Forgot device: $mac"
+    else
+        echo -e "${YELLOW}!${NC} Device not found: $mac"
+    fi
+    exit 0
+fi
+
+if $FORGET_ALL; then
+    echo "# Network Scan Device History" > "$HISTORY_FILE"
+    echo "# Format: MAC|IP|HOSTNAME|VENDOR|FIRST_SEEN|LAST_SEEN|VISIT_DATES" >> "$HISTORY_FILE"
+    rm -f "$CACHE_FILE"
+    echo -e "${GREEN}✓${NC} All device history cleared."
+    exit 0
+fi
+
+if $SHOW_LOG; then
+    if [[ -f "$LOG_FILE" ]]; then
+        echo -e "${BOLD}📋 Recent Scan Log:${NC}"
+        tail -20 "$LOG_FILE"
+    else
+        echo "No scan log yet."
+    fi
+    exit 0
+fi
+
+#=============================================================================
+# Live Scan (if requested or no cache)
+#=============================================================================
+
+if $LIVE_SCAN || [[ ! -f "$CACHE_FILE" ]]; then
+    if $LIVE_SCAN; then
+        echo -e "${DIM}Running live scan...${NC}"
+    fi
+    # Run the daemon script directly
+    "${HOME}/bin/network-scan-daemon"
+fi
+
+#=============================================================================
+# Read from Cache
+#=============================================================================
+
+if [[ ! -f "$CACHE_FILE" ]]; then
+    echo -e "${YELLOW}No scan data available. Running first scan...${NC}"
+    "${HOME}/bin/network-scan-daemon"
+fi
+
+# Read cache
+cache_content=$(cat "$CACHE_FILE")
+
+# Parse basic info
+timestamp=$(json_value "$cache_content" "timestamp")
+total_devices=$(json_value "$cache_content" "total_devices")
+new_count=$(json_value "$cache_content" "new_count")
+known_count=$(json_value "$cache_content" "known_count")
+scan_age=$(time_ago "$timestamp")
+
+#=============================================================================
+# Output
+#=============================================================================
+
+# Quiet mode
+if $QUIET; then
+    echo "$total_devices"
+    exit 0
+fi
+
+# Simple summary (default)
+if ! $VERBOSE; then
+    if [[ $new_count -gt 0 ]]; then
+        echo -e "${BOLD}🌐 Network:${NC} ${GREEN}$total_devices${NC} devices (${RED}${BOLD}⚠ $new_count NEW${NC}, ${DIM}$known_count known${NC}) ${DIM}[$scan_age]${NC}"
+        echo -e "${YELLOW}New devices detected! Run 'scan -v' for details${NC}"
+    else
+        echo -e "${BOLD}🌐 Network:${NC} ${GREEN}$total_devices${NC} devices (${DIM}all known${NC}) ${DIM}[$scan_age]${NC}"
+    fi
+    
+    # Warn if cache is stale
+    if is_cache_stale; then
+        echo -e "${DIM}Cache is old. Run 'scan --live' for fresh data.${NC}"
+    fi
+    exit 0
+fi
+
+#=============================================================================
+# Verbose/Full Output
+#=============================================================================
+
+echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${CYAN}║${NC}                    ${BOLD}🔍 Network Intelligence Report${NC}                       ${BOLD}${CYAN}║${NC}"
+echo -e "${BOLD}${CYAN}╠════════════════════════════════════════════════════════════════════════╣${NC}"
+
+echo -e "${BOLD}${CYAN}║${NC} ${BOLD}📡 Network:${NC} ${YELLOW}$NETWORK${NC} on ${DIM}$INTERFACE${NC}$(printf '%*s' $((30 - ${#NETWORK} - ${#INTERFACE})) '')${BOLD}${CYAN}║${NC}"
+echo -e "${BOLD}${CYAN}║${NC} ${BOLD}🏠 Your IP:${NC} ${GREEN}$MY_IP${NC}$(printf '%*s' $((52 - ${#MY_IP})) '')${BOLD}${CYAN}║${NC}"
+echo -e "${BOLD}${CYAN}║${NC} ${BOLD}📊 Devices:${NC} ${GREEN}$total_devices${NC} total (${RED}$new_count new${NC}, ${DIM}$known_count known${NC})$(printf '%*s' $((27 - ${#total_devices} - ${#new_count} - ${#known_count})) '')${BOLD}${CYAN}║${NC}"
+echo -e "${BOLD}${CYAN}║${NC} ${BOLD}🕐 Scanned:${NC} ${DIM}$scan_age${NC}$(printf '%*s' $((52 - ${#scan_age})) '')${BOLD}${CYAN}║${NC}"
+
+print_tracked_device_line "$cache_content"
+
+# Full mode: external info
+if $FULL; then
+    echo -e "${BOLD}${CYAN}╠════════════════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}                      ${BOLD}🌍 External Information${NC}                           ${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}╠════════════════════════════════════════════════════════════════════════╣${NC}"
+    
+    # Internet check
+    if ping -c 1 -W 2 8.8.8.8 &>/dev/null; then
+        internet="${GREEN}●${NC} Online"
+    else
+        internet="${RED}●${NC} Offline"
+    fi
+    echo -e "${BOLD}${CYAN}║${NC} ${BOLD}🔌 Internet:${NC} $internet$(printf '%*s' $((51 - 8)) '')${BOLD}${CYAN}║${NC}"
+    
+    # Public IP
+    public_ip=$(curl -s --max-time 3 ifconfig.me 2>/dev/null || echo "Unavailable")
+    [[ ${#public_ip} -gt 20 ]] && public_ip="${public_ip:0:20}..."
+    echo -e "${BOLD}${CYAN}║${NC} ${BOLD}🌐 Public IP:${NC} ${BLUE}$public_ip${NC}$(printf '%*s' $((50 - ${#public_ip})) '')${BOLD}${CYAN}║${NC}"
+    
+    # Weather
+    weather=$(curl -s --max-time 5 "wttr.in/?format=%l:+%c+%t" 2>/dev/null || echo "Unavailable")
+    [[ ${#weather} -gt 50 ]] && weather="${weather:0:47}..."
+    echo -e "${BOLD}${CYAN}║${NC} ${BOLD}🌤️  Weather:${NC} $weather$(printf '%*s' $((51 - ${#weather})) '')${BOLD}${CYAN}║${NC}"
+fi
+
+# Parse devices from JSON and display
+# Extract devices array
+devices_json=$(echo "$cache_content" | grep -o '"devices":[[:space:]]*\[.*\]' | sed 's/"devices":[[:space:]]*\[//' | sed 's/\]$//')
+
+# New devices section
+if [[ $new_count -gt 0 ]]; then
+    echo -e "${BOLD}${CYAN}╠════════════════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}              ${BOLD}${RED}⚠️  NEW/UNFAMILIAR DEVICES ($new_count)${NC}                          ${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}╠════════════════════════════════════════════════════════════════════════╣${NC}"
+    
+    # Parse each device
+    echo "$devices_json" | tr '}' '\n' | while read -r device; do
+        [[ -z "$device" ]] && continue
+        
+        is_known=$(echo "$device" | grep -o '"is_known":[^,]*' | cut -d: -f2 | tr -d ' ')
+        [[ "$is_known" == "true" ]] && continue
+        
+        ip=$(echo "$device" | grep -o '"ip":"[^"]*"' | cut -d'"' -f4)
+        display_name=$(echo "$device" | grep -o '"display_name":"[^"]*"' | cut -d'"' -f4)
+        custom_name=$(echo "$device" | grep -o '"custom_name":"[^"]*"' | cut -d'"' -f4)
+        vendor=$(echo "$device" | grep -o '"vendor":"[^"]*"' | cut -d'"' -f4)
+        category=$(echo "$device" | grep -o '"category":"[^"]*"' | cut -d'"' -f4)
+        is_rand=$(echo "$device" | grep -o '"is_randomized":[^,}]*' | cut -d: -f2 | tr -d ' ')
+        mac=$(echo "$device" | grep -o '"mac":"[^"]*"' | cut -d'"' -f4)
+        
+        [[ -z "$ip" ]] && continue
+        
+        # Format vendor
+        if [[ "$is_rand" == "true" ]]; then
+            vendor="🎲 Randomized"
+        fi
+        [[ ${#vendor} -gt 18 ]] && vendor="${vendor:0:15}..."
+        
+        # Format display name (custom name shown in bold if set)
+        display_host="${display_name:-$ip}"
+        [[ ${#display_host} -gt 22 ]] && display_host="${display_host:0:19}..."
+        
+        # Get emoji
+        emoji=$(get_category_emoji "$category")
+        
+        # Show custom name indicator
+        if [[ -n "$custom_name" ]]; then
+            printf "${BOLD}${CYAN}║${NC} ${RED}🆕${NC} %-15s ${BOLD}%-22s${NC} %-18s %s" "$ip" "$display_host" "$vendor" "$emoji $category"
+        else
+            printf "${BOLD}${CYAN}║${NC} ${RED}🆕${NC} %-15s %-22s %-18s %s" "$ip" "$display_host" "$vendor" "$emoji $category"
+        fi
+        printf "%*s${BOLD}${CYAN}║${NC}\n" 1 ""
+    done
+fi
+
+# Known devices section (only if --all or --full)
+if $SHOW_ALL && [[ $known_count -gt 0 ]]; then
+    echo -e "${BOLD}${CYAN}╠════════════════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}                    ${BOLD}${DIM}📋 Known Devices ($known_count)${NC}                             ${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}╠════════════════════════════════════════════════════════════════════════╣${NC}"
+    
+    echo "$devices_json" | tr '}' '\n' | while read -r device; do
+        [[ -z "$device" ]] && continue
+        
+        is_known=$(echo "$device" | grep -o '"is_known":[^,]*' | cut -d: -f2 | tr -d ' ')
+        [[ "$is_known" != "true" ]] && continue
+        
+        ip=$(echo "$device" | grep -o '"ip":"[^"]*"' | cut -d'"' -f4)
+        display_name=$(echo "$device" | grep -o '"display_name":"[^"]*"' | cut -d'"' -f4)
+        custom_name=$(echo "$device" | grep -o '"custom_name":"[^"]*"' | cut -d'"' -f4)
+        vendor=$(echo "$device" | grep -o '"vendor":"[^"]*"' | cut -d'"' -f4)
+        category=$(echo "$device" | grep -o '"category":"[^"]*"' | cut -d'"' -f4)
+        is_rand=$(echo "$device" | grep -o '"is_randomized":[^,}]*' | cut -d: -f2 | tr -d ' ')
+        
+        [[ -z "$ip" ]] && continue
+        
+        if [[ "$is_rand" == "true" ]]; then
+            vendor="🎲 Randomized"
+        fi
+        [[ ${#vendor} -gt 18 ]] && vendor="${vendor:0:15}..."
+        
+        display_host="${display_name:-$ip}"
+        [[ ${#display_host} -gt 22 ]] && display_host="${display_host:0:19}..."
+        
+        emoji=$(get_category_emoji "$category")
+        
+        if [[ -n "$custom_name" ]]; then
+            printf "${BOLD}${CYAN}║${NC} ${DIM}${GREEN}✓${NC} %-15s ${BOLD}%-22s${NC} %-18s %s${NC}" "$ip" "$display_host" "$vendor" "$emoji $category"
+        else
+            printf "${BOLD}${CYAN}║${NC} ${DIM}${GREEN}✓${NC} %-15s %-22s %-18s %s${NC}" "$ip" "$display_host" "$vendor" "$emoji $category"
+        fi
+        printf "%*s${BOLD}${CYAN}║${NC}\n" 1 ""
+    done
+fi
+
+echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════════════════╝${NC}"
+
+# Legend
+if [[ $new_count -gt 0 ]]; then
+    echo -e "${DIM}🆕 = New device (seen <${KNOWN_THRESHOLD} times) | ✓ = Known device${NC}"
+fi
+echo -e "${DIM}Scans run every 30min via cron. Use --live for fresh scan, --list for history.${NC}"

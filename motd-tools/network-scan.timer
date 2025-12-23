@@ -1,0 +1,34 @@
+# Network Scan Timer
+#
+# Triggers network-scan.service every 30 minutes.
+#
+# Installation:
+#   mkdir -p ~/.config/systemd/user
+#   cp network-scan.service ~/.config/systemd/user/
+#   cp network-scan.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now network-scan.timer
+#
+# Check status:
+#   systemctl --user status network-scan.timer
+#   systemctl --user list-timers --all
+#
+
+[Unit]
+Description=Run network scanner every 30 minutes
+
+[Timer]
+# Run 2 minutes after boot
+OnBootSec=2min
+
+# Then every 30 minutes
+OnUnitActiveSec=30min
+
+# Randomize start time by up to 1 minute to avoid thundering herd
+RandomizedDelaySec=60
+
+# Persist timer across reboots
+Persistent=true
+
+[Install]
+WantedBy=timers.target

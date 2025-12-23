@@ -1,0 +1,35 @@
+# Phone Presence Monitor Service
+#
+# Monitors phone presence on network and sends Telegram notifications.
+#
+# Installation:
+#   mkdir -p ~/.config/systemd/user
+#   cp phone-monitor.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now phone-monitor.service
+#
+# Check status:
+#   systemctl --user status phone-monitor
+#   journalctl --user -u phone-monitor -f
+#
+
+[Unit]
+Description=Phone Presence Monitor (Telegram Notifications)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/telegramapp/phone_presence_monitor
+ExecStart=/usr/bin/python3 %h/code/telegramapp/phone_presence_monitor/monitor.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

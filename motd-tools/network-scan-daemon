@@ -1,0 +1,358 @@
+#!/bin/bash
+#
+# network-scan-daemon - Background network scanner for cron
+# Runs every 30 minutes, saves results to cache for instant display
+#
+# Install: Add to crontab with: crontab -e
+#   */30 * * * * /home/madan/bin/network-scan-daemon
+#
+
+set -euo pipefail
+
+# Configuration - load from config file
+CONFIG_FILE="${HOME}/bin/config/router.conf"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+    NETWORK=$(grep -E "^network\s*=" "$CONFIG_FILE" | cut -d'=' -f2 | tr -d ' ' || echo "192.168.0.0/24")
+    INTERFACE=$(grep -E "^interface\s*=" "$CONFIG_FILE" | cut -d'=' -f2 | tr -d ' ' || echo "eth0")
+    MY_IP=$(grep -E "^my_ip\s*=" "$CONFIG_FILE" | cut -d'=' -f2 | tr -d ' ' || echo "")
+else
+    echo "Warning: Config file not found: $CONFIG_FILE" >&2
+    NETWORK="192.168.0.0/24"
+    INTERFACE="eth0"
+    MY_IP=""
+fi
+
+MAC_DB="/usr/share/nmap/nmap-mac-prefixes"
+
+# Paths
+DATA_DIR="${HOME}/.local/share/network-scan"
+CACHE_FILE="${DATA_DIR}/scan_cache.json"
+HISTORY_FILE="${DATA_DIR}/device_history.db"
+NAMES_FILE="${DATA_DIR}/device_names.db"
+LOG_FILE="${DATA_DIR}/scan.log"
+LOCK_FILE="${DATA_DIR}/scan.lock"
+
+# Settings
+KNOWN_THRESHOLD=3
+HISTORY_DAYS=30
+MAX_LOG_LINES=1000
+
+#=============================================================================
+# Initialization
+#=============================================================================
+
+mkdir -p "$DATA_DIR"
+
+# Logging function
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+# Prevent concurrent runs
+if [[ -f "$LOCK_FILE" ]]; then
+    pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        log "Another scan is running (PID $pid), exiting"
+        exit 0
+    fi
+fi
+echo $$ > "$LOCK_FILE"
+trap "rm -f '$LOCK_FILE'" EXIT
+
+log "Starting network scan"
+
+#=============================================================================
+# Helper Functions
+#=============================================================================
+
+# Initialize history file if needed
+init_history() {
+    if [[ ! -f "$HISTORY_FILE" ]]; then
+        echo "# Network Scan Device History" > "$HISTORY_FILE"
+        echo "# Format: MAC|IP|HOSTNAME|VENDOR|FIRST_SEEN|LAST_SEEN|VISIT_DATES" >> "$HISTORY_FILE"
+    fi
+}
+
+# Get custom device name
+get_custom_name() {
+    local mac="$1"
+    mac=$(echo "$mac" | tr '[:lower:]' '[:upper:]')
+    if [[ -f "$NAMES_FILE" ]]; then
+        local result=$(grep -i "^${mac}|" "$NAMES_FILE" 2>/dev/null | cut -d'|' -f2 | head -1 || echo "")
+        echo "$result"
+    else
+        echo ""
+    fi
+}
+
+# Lookup MAC vendor
+lookup_vendor() {
+    local mac="$1"
+    local oui=$(echo "$mac" | tr '[:lower:]' '[:upper:]' | tr -d ':' | cut -c1-6)
+    if [[ -f "$MAC_DB" ]]; then
+        grep -i "^$oui" "$MAC_DB" 2>/dev/null | cut -d' ' -f2- | head -1 || echo "Unknown"
+    else
+        echo "Unknown"
+    fi
+}
+
+# Check if MAC is randomized
+is_random_mac() {
+    local mac="$1"
+    local second_char=$(echo "$mac" | cut -c2 | tr '[:lower:]' '[:upper:]')
+    [[ "$second_char" =~ [26AE] ]]
+}
+
+# Resolve hostname using multiple methods (with timeouts)
+resolve_hostname() {
+    local ip="$1"
+    local hostname=""
+    
+    # Method 1: DNS reverse lookup (2 second timeout)
+    hostname=$(timeout 2 host "$ip" 2>/dev/null | grep "domain name pointer" | awk '{print $NF}' | sed 's/\.$//' | head -1)
+    [[ -n "$hostname" && "$hostname" != "$ip" ]] && { echo "$hostname"; return; }
+    
+    # Method 2: Avahi/mDNS (2 second timeout)
+    hostname=$(timeout 2 avahi-resolve -a "$ip" 2>/dev/null | awk '{print $2}' | head -1)
+    [[ -n "$hostname" ]] && { echo "$hostname"; return; }
+    
+    # Method 3: NetBIOS (if nmblookup available, 2 second timeout)
+    if command -v nmblookup &>/dev/null; then
+        hostname=$(timeout 2 nmblookup -A "$ip" 2>/dev/null | grep '<00>' | head -1 | awk '{print $1}')
+        [[ -n "$hostname" && "$hostname" != "*" ]] && { echo "$hostname"; return; }
+    fi
+    
+    echo ""
+}
+
+# Categorize device
+categorize_device() {
+    local vendor="$1"
+    local hostname="$2"
+    vendor=$(echo "$vendor" | tr '[:upper:]' '[:lower:]')
+    hostname=$(echo "$hostname" | tr '[:upper:]' '[:lower:]')
+    
+    if [[ "$hostname" =~ (iphone|ipad|android|pixel|galaxy|phone) ]]; then
+        echo "phone"
+    elif [[ "$hostname" =~ (macbook|laptop|thinkpad|dell|hp-|lenovo) ]]; then
+        echo "laptop"
+    elif [[ "$hostname" =~ (imac|desktop|pc|workstation|macmini) ]]; then
+        echo "desktop"
+    elif [[ "$hostname" =~ (tv|roku|firestick|chromecast|appletv) ]]; then
+        echo "tv"
+    elif [[ "$hostname" =~ (printer|canon|epson) ]]; then
+        echo "printer"
+    elif [[ "$hostname" =~ (echo|alexa|google-home|homepod) ]]; then
+        echo "speaker"
+    elif [[ "$hostname" =~ (cam|camera|ring|nest) ]]; then
+        echo "camera"
+    elif [[ "$hostname" =~ (gateway|router|_gateway) ]]; then
+        echo "router"
+    elif [[ "$vendor" =~ (apple) ]]; then
+        echo "apple"
+    elif [[ "$vendor" =~ (samsung) ]]; then
+        echo "samsung"
+    elif [[ "$vendor" =~ (google) ]]; then
+        echo "google"
+    elif [[ "$vendor" =~ (amazon) ]]; then
+        echo "amazon"
+    elif [[ "$vendor" =~ (raspberry) ]]; then
+        echo "raspberry"
+    elif [[ "$vendor" =~ (intel|dell|hp|lenovo|asus|acer) ]]; then
+        echo "computer"
+    elif [[ "$vendor" =~ (tp-link|netgear|linksys|ubiquiti|cisco) ]]; then
+        echo "network"
+    elif [[ "$vendor" =~ (espressif|tuya|shelly|sonoff) ]]; then
+        echo "iot"
+    else
+        echo "unknown"
+    fi
+}
+
+# Count recent visits
+count_recent_visits() {
+    local visit_dates="$1"
+    local cutoff_date=$(date -d "-${HISTORY_DAYS} days" +%Y-%m-%d 2>/dev/null || date -v-${HISTORY_DAYS}d +%Y-%m-%d)
+    local count=0
+    
+    IFS=',' read -ra dates <<< "$visit_dates"
+    for d in "${dates[@]}"; do
+        if [[ "$d" > "$cutoff_date" || "$d" == "$cutoff_date" ]]; then
+            ((count++)) || true
+        fi
+    done
+    echo "$count"
+}
+
+# Check if device is known
+is_known_device() {
+    local mac="$1"
+    mac=$(echo "$mac" | tr '[:lower:]' '[:upper:]')
+    local record=$(grep -i "^${mac}|" "$HISTORY_FILE" 2>/dev/null | head -1 || echo "")
+    
+    if [[ -z "$record" ]]; then
+        return 1
+    fi
+    
+    local visit_dates=$(echo "$record" | cut -d'|' -f7)
+    local recent_count=$(count_recent_visits "$visit_dates")
+    
+    [[ $recent_count -ge $KNOWN_THRESHOLD ]]
+}
+
+# Update device history
+update_device_history() {
+    local mac="$1"
+    local ip="$2"
+    local hostname="$3"
+    local vendor="$4"
+    
+    mac=$(echo "$mac" | tr '[:lower:]' '[:upper:]')
+    local today=$(date +%Y-%m-%d)
+    local record=$(grep -i "^${mac}|" "$HISTORY_FILE" 2>/dev/null | head -1 || echo "")
+    
+    if [[ -z "$record" ]]; then
+        echo "${mac}|${ip}|${hostname}|${vendor}|${today}|${today}|${today}" >> "$HISTORY_FILE"
+    else
+        local first_seen=$(echo "$record" | cut -d'|' -f5)
+        local visit_dates=$(echo "$record" | cut -d'|' -f7)
+        
+        if [[ ! "$visit_dates" =~ $today ]]; then
+            visit_dates="${visit_dates},${today}"
+        fi
+        
+        local tmp_file=$(mktemp)
+        grep -iv "^${mac}|" "$HISTORY_FILE" > "$tmp_file" || true
+        echo "${mac}|${ip}|${hostname}|${vendor}|${first_seen}|${today}|${visit_dates}" >> "$tmp_file"
+        mv "$tmp_file" "$HISTORY_FILE"
+    fi
+}
+
+#=============================================================================
+# Main Scan
+#=============================================================================
+
+init_history
+
+# Run nmap scan
+if sudo -n true 2>/dev/null; then
+    scan_output=$(sudo nmap -sn "$NETWORK" 2>/dev/null)
+else
+    scan_output=$(nmap -sn "$NETWORK" 2>/dev/null)
+fi
+
+# Get ARP table
+declare -A mac_table
+while IFS= read -r line; do
+    ip=$(echo "$line" | awk '{print $1}')
+    mac=$(echo "$line" | awk '{print $5}')
+    if [[ "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
+        mac_table["$ip"]="$mac"
+    fi
+done < <(ip neigh show 2>/dev/null)
+
+# Parse hosts
+hosts=$(echo "$scan_output" | grep "Nmap scan report for" | sed 's/Nmap scan report for //')
+host_count=$(echo "$scan_output" | grep -c "Nmap scan report for" || echo "0")
+
+# Build device list
+declare -a devices_json=()
+new_count=0
+known_count=0
+
+while IFS= read -r host; do
+    [[ -z "$host" ]] && continue
+    
+    # Extract IP
+    if [[ "$host" =~ \(([0-9.]+)\) ]]; then
+        ip="${BASH_REMATCH[1]}"
+        scan_hostname=$(echo "$host" | sed 's/ (.*//')
+    else
+        ip="$host"
+        scan_hostname=""
+    fi
+    
+    # Skip this machine
+    [[ "$ip" == "$MY_IP" ]] && continue
+    
+    # Get MAC
+    mac="${mac_table[$ip]:-}"
+    if [[ -z "$mac" ]]; then
+        mac=$(echo "$scan_output" | grep -A2 "$ip" | grep -i "MAC Address" | awk '{print $3}' | head -1)
+    fi
+    
+    [[ -z "$mac" ]] && continue
+    mac=$(echo "$mac" | tr '[:lower:]' '[:upper:]')
+    
+    # Get vendor
+    if is_random_mac "$mac"; then
+        vendor="Randomized"
+        is_randomized="true"
+    else
+        vendor=$(lookup_vendor "$mac")
+        is_randomized="false"
+    fi
+    
+    # Resolve hostname
+    if [[ -z "$scan_hostname" ]]; then
+        hostname=$(resolve_hostname "$ip")
+    else
+        hostname="$scan_hostname"
+    fi
+    
+    # Check for custom name (overrides hostname for display)
+    custom_name=$(get_custom_name "$mac")
+    display_name="${custom_name:-$hostname}"
+    
+    # Categorize
+    category=$(categorize_device "$vendor" "$hostname")
+    
+    # Update history
+    update_device_history "$mac" "$ip" "$hostname" "$vendor"
+    
+    # Check if known
+    if is_known_device "$mac"; then
+        is_known="true"
+        ((known_count++)) || true
+    else
+        is_known="false"
+        ((new_count++)) || true
+    fi
+    
+    # Build JSON entry (escape special chars)
+    hostname_escaped=$(echo "$hostname" | sed 's/"/\\"/g')
+    display_name_escaped=$(echo "$display_name" | sed 's/"/\\"/g')
+    vendor_escaped=$(echo "$vendor" | sed 's/"/\\"/g')
+    custom_name_escaped=$(echo "$custom_name" | sed 's/"/\\"/g')
+    
+    devices_json+=("{\"mac\":\"$mac\",\"ip\":\"$ip\",\"hostname\":\"$hostname_escaped\",\"display_name\":\"$display_name_escaped\",\"custom_name\":\"$custom_name_escaped\",\"vendor\":\"$vendor_escaped\",\"category\":\"$category\",\"is_known\":$is_known,\"is_randomized\":$is_randomized}")
+    
+done <<< "$hosts"
+
+# Build final JSON
+timestamp=$(date -Iseconds)
+devices_array=$(IFS=,; echo "${devices_json[*]}")
+
+cat > "$CACHE_FILE" << EOF
+{
+  "timestamp": "$timestamp",
+  "network": "$NETWORK",
+  "interface": "$INTERFACE",
+  "my_ip": "$MY_IP",
+  "total_devices": $((new_count + known_count)),
+  "new_count": $new_count,
+  "known_count": $known_count,
+  "devices": [$devices_array]
+}
+EOF
+
+log "Scan complete: $((new_count + known_count)) devices ($new_count new, $known_count known)"
+
+# Trim log file if too large
+if [[ $(wc -l < "$LOG_FILE") -gt $MAX_LOG_LINES ]]; then
+    tail -n $((MAX_LOG_LINES / 2)) "$LOG_FILE" > "${LOG_FILE}.tmp"
+    mv "${LOG_FILE}.tmp" "$LOG_FILE"
+fi
+
+exit 0
