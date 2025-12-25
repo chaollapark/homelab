@@ -1,0 +1,683 @@
+#!/bin/bash
+#
+# dns-traffic - Analyze DNS traffic for specific devices
+#
+# Usage:
+#   dns-traffic capture [--device IP|MAC] [--duration SECONDS]  # Capture live DNS traffic
+#   dns-traffic analyze [--file PCAP] [--top N]                 # Analyze captured traffic
+#   dns-traffic live [--device IP|MAC]                          # Live view of DNS queries
+#   dns-traffic report [--device IP|MAC] [--file PCAP]          # Generate domain report
+#
+# Requires: tcpdump (for capture), tshark (optional, for better parsing)
+#
+
+set -euo pipefail
+
+# Configuration
+# Get the real user's home directory (even when running with sudo)
+if [[ -n "${SUDO_USER:-}" ]]; then
+    REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+else
+    REAL_HOME="$HOME"
+fi
+
+CONFIG_FILE="${HOME}/bin/config/router.conf"
+DATA_DIR="${REAL_HOME}/.local/share/dns-traffic"
+CAPTURE_DIR="${DATA_DIR}/captures"
+REPORT_DIR="${DATA_DIR}/reports"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m'
+BOLD='\033[1m'
+DIM='\033[2m'
+
+# Defaults
+INTERFACE="enp2s0f0"
+DURATION=60
+TOP_N=20
+DEVICE_FILTER=""
+PCAP_FILE=""
+LOCAL_MODE=false
+
+# Load config
+if [[ -f "$CONFIG_FILE" ]]; then
+    INTERFACE=$(grep -E "^interface\s*=" "$CONFIG_FILE" | cut -d'=' -f2 | tr -d ' ' || echo "$INTERFACE")
+fi
+
+# Create directories
+mkdir -p "$DATA_DIR" "$CAPTURE_DIR" "$REPORT_DIR"
+
+#=============================================================================
+# Helper Functions
+#=============================================================================
+
+usage() {
+    cat << 'EOF'
+dns-traffic - Analyze DNS traffic for specific devices
+
+USAGE:
+    dns-traffic <COMMAND> [OPTIONS]
+
+COMMANDS:
+    capture     Capture DNS traffic to a file
+    live        Show live DNS queries in real-time
+    analyze     Analyze a captured pcap file
+    report      Generate a top domains report
+    list        List saved captures
+    devices     Show devices with DNS activity
+
+OPTIONS:
+    --device, -d IP|MAC    Filter by device IP or MAC address
+    --duration, -t SECS    Capture duration in seconds (default: 60)
+    --file, -f FILE        PCAP file to analyze
+    --top, -n N            Show top N domains (default: 20)
+    --interface, -i IFACE  Network interface (default: from config)
+    --local                Capture this machine's DNS (uses loopback)
+    --help, -h             Show this help
+
+EXAMPLES:
+    # Capture DNS traffic for 5 minutes
+    dns-traffic capture -t 300
+
+    # Capture DNS for a specific device
+    dns-traffic capture -d 192.168.0.50 -t 120
+
+    # Live view of all DNS queries
+    dns-traffic live
+
+    # Live view for specific device
+    dns-traffic live -d 192.168.0.50
+
+    # Analyze a capture file
+    dns-traffic analyze -f ~/captures/dns.pcap
+
+    # Generate top domains report
+    dns-traffic report -n 50
+
+    # Capture THIS machine's DNS traffic
+    sudo dns-traffic capture --local -t 60
+
+NOTE:
+    Capture requires root/sudo privileges for tcpdump.
+    Use 'sudo dns-traffic capture' for capturing.
+EOF
+    exit 0
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}Error:${NC} This command requires root privileges."
+        echo -e "Run with: ${BOLD}sudo dns-traffic $1${NC}"
+        exit 1
+    fi
+}
+
+# Resolve MAC to IP using arp cache or network-scan data
+resolve_device() {
+    local device="$1"
+    
+    # If it looks like an IP, return as-is
+    if [[ "$device" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$device"
+        return
+    fi
+    
+    # If it looks like a MAC, try to find the IP
+    if [[ "$device" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+        local mac=$(echo "$device" | tr '[:upper:]' '[:lower:]')
+        # Check arp cache
+        local ip=$(arp -an 2>/dev/null | grep -i "$mac" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        if [[ -n "$ip" ]]; then
+            echo "$ip"
+            return
+        fi
+        # Check network-scan history
+        local history_file="${HOME}/.local/share/network-scan/device_history.db"
+        if [[ -f "$history_file" ]]; then
+            ip=$(grep -i "^${mac}|" "$history_file" | cut -d'|' -f2 | head -1)
+            if [[ -n "$ip" ]]; then
+                echo "$ip"
+                return
+            fi
+        fi
+    fi
+    
+    # Try to find by hostname in network-scan
+    local cache_file="${HOME}/.local/share/network-scan/scan_cache.json"
+    if [[ -f "$cache_file" ]]; then
+        local ip=$(grep -o "\"ip\":\"[^\"]*\"" "$cache_file" | while read -r line; do
+            local check_ip=$(echo "$line" | cut -d'"' -f4)
+            if grep -qi "\"$device\"" "$cache_file" 2>/dev/null; then
+                echo "$check_ip"
+                break
+            fi
+        done | head -1)
+        if [[ -n "$ip" ]]; then
+            echo "$ip"
+            return
+        fi
+    fi
+    
+    echo ""
+}
+
+# Build tcpdump filter for device
+build_filter() {
+    local device_ip="$1"
+    local filter="port 53"
+    
+    if [[ -n "$device_ip" ]]; then
+        filter="host $device_ip and port 53"
+    fi
+    
+    echo "$filter"
+}
+
+# Parse DNS query from tcpdump output
+parse_dns_query() {
+    local line="$1"
+    # Extract domain from tcpdump DNS output
+    # Format: 12:34:56.789 IP 192.168.0.50.12345 > 8.8.8.8.53: 12345+ A? example.com. (30)
+    
+    local domain=$(echo "$line" | grep -oE '[A-Z]+\? [^ ]+' | sed 's/[A-Z]*? //' | sed 's/\.$//')
+    if [[ -n "$domain" ]]; then
+        echo "$domain"
+    fi
+}
+
+#=============================================================================
+# Commands
+#=============================================================================
+
+cmd_capture() {
+    check_root "capture"
+    
+    # Use loopback for local mode
+    local capture_interface="$INTERFACE"
+    if $LOCAL_MODE; then
+        capture_interface="lo"
+    fi
+    
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local filename="dns_capture_${timestamp}.pcap"
+    local filepath="${CAPTURE_DIR}/${filename}"
+    
+    # Use temp file because tcpdump drops privileges to tcpdump user
+    local tmpfile="/tmp/${filename}"
+    
+    
+    local filter=$(build_filter "$DEVICE_FILTER")
+    
+    echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}           ${BOLD}📡 DNS Traffic Capture${NC}                          ${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}╠════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BOLD}${CYAN}║${NC} Interface: ${GREEN}$capture_interface${NC}$(printf '%*s' $((42 - ${#capture_interface})) '')${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}║${NC} Duration:  ${GREEN}${DURATION}s${NC}$(printf '%*s' $((42 - ${#DURATION})) '')${BOLD}${CYAN}║${NC}"
+    if [[ -n "$DEVICE_FILTER" ]]; then
+        echo -e "${BOLD}${CYAN}║${NC} Device:    ${GREEN}$DEVICE_FILTER${NC}$(printf '%*s' $((42 - ${#DEVICE_FILTER})) '')${BOLD}${CYAN}║${NC}"
+    fi
+    if $LOCAL_MODE; then
+        echo -e "${BOLD}${CYAN}║${NC} Mode:      ${YELLOW}Local (this machine)${NC}$(printf '%*s' 22 '')${BOLD}${CYAN}║${NC}"
+    fi
+    echo -e "${BOLD}${CYAN}║${NC} Output:    ${DIM}${filename}${NC}$(printf '%*s' $((42 - ${#filename})) '')${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${YELLOW}Capturing DNS traffic... Press Ctrl+C to stop early.${NC}"
+    echo ""
+    
+    # Run tcpdump with timeout (use temp file, then move)
+    timeout "$DURATION" tcpdump -i "$capture_interface" -w "$tmpfile" "$filter" 2>&1 || true
+    
+    # Move temp file to final location
+    if [[ -f "$tmpfile" ]] && [[ -s "$tmpfile" ]]; then
+        mv "$tmpfile" "$filepath"
+        chown "${SUDO_USER:-$USER}:${SUDO_USER:-$USER}" "$filepath" 2>/dev/null || true
+    fi
+    
+    if [[ -f "$filepath" ]] && [[ -s "$filepath" ]]; then
+        local size=$(du -h "$filepath" | cut -f1)
+        local packets=$(tcpdump -r "$filepath" 2>/dev/null | wc -l)
+        echo ""
+        echo -e "${GREEN}✓${NC} Capture complete!"
+        echo -e "  File: ${CYAN}$filepath${NC}"
+        echo -e "  Size: ${GREEN}$size${NC}"
+        echo -e "  Packets: ${GREEN}$packets${NC}"
+        echo ""
+        echo -e "Analyze with: ${BOLD}dns-traffic analyze -f $filepath${NC}"
+    else
+        echo -e "${RED}✗${NC} Capture failed or no packets captured."
+    fi
+}
+
+cmd_live() {
+    check_root "live"
+    
+    # Use loopback for local mode
+    local capture_interface="$INTERFACE"
+    if $LOCAL_MODE; then
+        capture_interface="lo"
+    fi
+    
+    local filter=$(build_filter "$DEVICE_FILTER")
+    
+    echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}           ${BOLD}🔴 Live DNS Traffic Monitor${NC}                      ${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}╠════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BOLD}${CYAN}║${NC} Interface: ${GREEN}$capture_interface${NC}$(printf '%*s' $((42 - ${#capture_interface})) '')${BOLD}${CYAN}║${NC}"
+    if [[ -n "$DEVICE_FILTER" ]]; then
+        echo -e "${BOLD}${CYAN}║${NC} Device:    ${GREEN}$DEVICE_FILTER${NC}$(printf '%*s' $((42 - ${#DEVICE_FILTER})) '')${BOLD}${CYAN}║${NC}"
+    else
+        echo -e "${BOLD}${CYAN}║${NC} Device:    ${DIM}All devices${NC}$(printf '%*s' 31 '')${BOLD}${CYAN}║${NC}"
+    fi
+    if $LOCAL_MODE; then
+        echo -e "${BOLD}${CYAN}║${NC} Mode:      ${YELLOW}Local (this machine)${NC}$(printf '%*s' 22 '')${BOLD}${CYAN}║${NC}"
+    fi
+    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${YELLOW}Monitoring DNS queries... Press Ctrl+C to stop.${NC}"
+    echo -e "${DIM}─────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    # Use tcpdump to show live DNS queries
+    tcpdump -i "$capture_interface" -l -n "$filter" 2>/dev/null | while read -r line; do
+        # Parse and format the output
+        if echo "$line" | grep -qE '\? [^ ]+\.' ; then
+            local timestamp=$(echo "$line" | awk '{print $1}')
+            local src_ip=$(echo "$line" | grep -oE 'IP [0-9.]+' | head -1 | cut -d' ' -f2)
+            local domain=$(echo "$line" | grep -oE '[A-Z]+\? [^ ]+' | sed 's/[A-Z]*? //' | sed 's/\.$//')
+            local query_type=$(echo "$line" | grep -oE '[A-Z]+\?' | sed 's/\?//')
+            
+            if [[ -n "$domain" ]]; then
+                printf "${DIM}%s${NC} ${CYAN}%-15s${NC} ${YELLOW}%-5s${NC} ${GREEN}%s${NC}\n" \
+                    "$timestamp" "${src_ip:-unknown}" "${query_type:-?}" "$domain"
+            fi
+        fi
+    done
+}
+
+cmd_analyze() {
+    local file="$PCAP_FILE"
+    
+    # If no file specified, use the latest capture
+    if [[ -z "$file" ]]; then
+        file=$(ls -t "$CAPTURE_DIR"/*.pcap 2>/dev/null | head -1)
+        if [[ -z "$file" ]]; then
+            echo -e "${RED}Error:${NC} No capture files found."
+            echo "Run 'dns-traffic capture' first or specify a file with -f"
+            exit 1
+        fi
+        echo -e "${DIM}Using latest capture: $file${NC}"
+    fi
+    
+    if [[ ! -f "$file" ]]; then
+        echo -e "${RED}Error:${NC} File not found: $file"
+        exit 1
+    fi
+    
+    echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}           ${BOLD}📊 DNS Traffic Analysis${NC}                         ${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}╠════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BOLD}${CYAN}║${NC} File: ${DIM}$(basename "$file")${NC}$(printf '%*s' $((47 - ${#file})) '')${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    
+    # tcpdump drops privileges and can't read files in user directories
+    # Copy to temp location for reading
+    local tmpfile="/tmp/dns_analyze_$$.pcap"
+    cp "$file" "$tmpfile"
+    trap "rm -f '$tmpfile'" EXIT
+    
+    # Use temp file for analysis
+    file="$tmpfile"
+    
+    # Check if tshark is available for better parsing
+    if command -v tshark &>/dev/null; then
+        analyze_with_tshark "$file"
+    else
+        analyze_with_tcpdump "$file"
+    fi
+}
+
+analyze_with_tshark() {
+    local file="$1"
+    
+    echo -e "${BOLD}Top $TOP_N Queried Domains:${NC}"
+    echo -e "${DIM}─────────────────────────────────────────────────────────────${NC}"
+    
+    # Extract DNS queries and count
+    tshark -r "$file" -Y "dns.flags.response == 0" -T fields -e dns.qry.name 2>/dev/null | \
+        sort | uniq -c | sort -rn | head -"$TOP_N" | \
+        while read -r count domain; do
+            printf "  ${GREEN}%6d${NC}  ${CYAN}%s${NC}\n" "$count" "$domain"
+        done
+    
+    echo ""
+    echo -e "${BOLD}Query Types:${NC}"
+    echo -e "${DIM}─────────────────────────────────────────────────────────────${NC}"
+    
+    tshark -r "$file" -Y "dns.flags.response == 0" -T fields -e dns.qry.type 2>/dev/null | \
+        sort | uniq -c | sort -rn | head -10 | \
+        while read -r count qtype; do
+            local type_name=$(dns_type_name "$qtype")
+            printf "  ${GREEN}%6d${NC}  ${YELLOW}%s${NC}\n" "$count" "$type_name"
+        done
+    
+    echo ""
+    echo -e "${BOLD}Top Querying Devices:${NC}"
+    echo -e "${DIM}─────────────────────────────────────────────────────────────${NC}"
+    
+    tshark -r "$file" -Y "dns.flags.response == 0" -T fields -e ip.src 2>/dev/null | \
+        sort | uniq -c | sort -rn | head -10 | \
+        while read -r count ip; do
+            printf "  ${GREEN}%6d${NC}  ${CYAN}%s${NC}\n" "$count" "$ip"
+        done
+}
+
+analyze_with_tcpdump() {
+    local file="$1"
+    
+    echo -e "${BOLD}Top $TOP_N Queried Domains:${NC}"
+    echo -e "${DIM}─────────────────────────────────────────────────────────────${NC}"
+    
+    # Parse with tcpdump (less accurate but works without tshark)
+    tcpdump -r "$file" -n 2>/dev/null | \
+        grep -oE '[A-Z]+\? [^ ]+' | \
+        sed 's/[A-Z]*? //' | sed 's/\.$//' | \
+        sort | uniq -c | sort -rn | head -"$TOP_N" | \
+        while read -r count domain; do
+            printf "  ${GREEN}%6d${NC}  ${CYAN}%s${NC}\n" "$count" "$domain"
+        done
+    
+    echo ""
+    echo -e "${BOLD}Top Querying Devices:${NC}"
+    echo -e "${DIM}─────────────────────────────────────────────────────────────${NC}"
+    
+    tcpdump -r "$file" -n 2>/dev/null | \
+        grep -oE 'IP [0-9.]+\.[0-9]+ >' | \
+        sed 's/IP //' | sed 's/\.[0-9]* >//' | \
+        sort | uniq -c | sort -rn | head -10 | \
+        while read -r count ip; do
+            printf "  ${GREEN}%6d${NC}  ${CYAN}%s${NC}\n" "$count" "$ip"
+        done
+    
+    echo ""
+    echo -e "${DIM}Note: Install tshark for more detailed analysis: sudo apt install tshark${NC}"
+}
+
+dns_type_name() {
+    case "$1" in
+        1) echo "A (IPv4)" ;;
+        28) echo "AAAA (IPv6)" ;;
+        5) echo "CNAME" ;;
+        15) echo "MX" ;;
+        16) echo "TXT" ;;
+        2) echo "NS" ;;
+        6) echo "SOA" ;;
+        12) echo "PTR" ;;
+        33) echo "SRV" ;;
+        65) echo "HTTPS" ;;
+        *) echo "Type $1" ;;
+    esac
+}
+
+cmd_report() {
+    local file="$PCAP_FILE"
+    local device_ip=""
+    
+    # tcpdump drops privileges and can't read files in user directories
+    # We'll copy to temp location for reading
+    local tmpfile="/tmp/dns_report_$$.pcap"
+    trap "rm -f '$tmpfile'" EXIT
+    
+    
+    if [[ -n "$DEVICE_FILTER" ]]; then
+        device_ip=$(resolve_device "$DEVICE_FILTER")
+        if [[ -z "$device_ip" ]]; then
+            echo -e "${YELLOW}Warning:${NC} Could not resolve device: $DEVICE_FILTER"
+        fi
+    fi
+    
+    # If no file specified, use the latest capture
+    if [[ -z "$file" ]]; then
+        file=$(ls -t "$CAPTURE_DIR"/*.pcap 2>/dev/null | head -1)
+        if [[ -z "$file" ]]; then
+            echo -e "${RED}Error:${NC} No capture files found."
+            exit 1
+        fi
+    fi
+    
+    # Copy to temp for tcpdump access
+    cp "$file" "$tmpfile"
+    local analysis_file="$tmpfile"
+    
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local report_file="${REPORT_DIR}/dns_report_${timestamp}.txt"
+    
+    echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}           ${BOLD}📋 DNS Traffic Report${NC}                           ${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════╝${NC}"
+    
+    {
+        echo "DNS Traffic Report"
+        echo "Generated: $(date)"
+        echo "Source: $(basename "$file")"
+        if [[ -n "$device_ip" ]]; then
+            echo "Device: $device_ip"
+        fi
+        echo ""
+        echo "=========================================="
+        echo "TOP $TOP_N QUERIED DOMAINS"
+        echo "=========================================="
+        
+        if command -v tshark &>/dev/null; then
+            local filter=""
+            if [[ -n "$device_ip" ]]; then
+                filter="dns.flags.response == 0 and ip.src == $device_ip"
+            else
+                filter="dns.flags.response == 0"
+            fi
+            tshark -r "$file" -Y "$filter" -T fields -e dns.qry.name 2>/dev/null | \
+                sort | uniq -c | sort -rn | head -"$TOP_N" | \
+                while read -r count domain; do
+                    printf "%6d  %s\n" "$count" "$domain"
+                done
+        else
+            tcpdump -r "$file" -n 2>/dev/null | \
+                grep -oE '[A-Z]+\? [^ ]+' | \
+                sed 's/[A-Z]*? //' | sed 's/\.$//' | \
+                sort | uniq -c | sort -rn | head -"$TOP_N" | \
+                while read -r count domain; do
+                    printf "%6d  %s\n" "$count" "$domain"
+                done
+        fi
+        
+        echo ""
+        echo "=========================================="
+        echo "DOMAIN CATEGORIES"
+        echo "=========================================="
+        
+        # Categorize domains
+        if command -v tshark &>/dev/null; then
+            local domains=$(tshark -r "$file" -Y "dns.flags.response == 0" -T fields -e dns.qry.name 2>/dev/null | sort -u)
+        else
+            local domains=$(tcpdump -r "$file" -n 2>/dev/null | grep -oE '[A-Z]+\? [^ ]+' | sed 's/[A-Z]*? //' | sed 's/\.$//' | sort -u)
+        fi
+        
+        local social=0 streaming=0 ads=0 google=0 microsoft=0 apple=0 other=0
+        
+        while read -r domain; do
+            [[ -z "$domain" ]] && continue
+            case "$domain" in
+                *facebook*|*instagram*|*twitter*|*tiktok*|*snapchat*|*whatsapp*) ((social++)) ;;
+                *netflix*|*youtube*|*spotify*|*twitch*|*disney*|*hulu*) ((streaming++)) ;;
+                *doubleclick*|*googlesyndication*|*adservice*|*ads.*|*tracking*) ((ads++)) ;;
+                *google*|*goog*|*gmail*|*gstatic*) ((google++)) ;;
+                *microsoft*|*msn*|*bing*|*azure*|*office*|*live.com*) ((microsoft++)) ;;
+                *apple*|*icloud*) ((apple++)) ;;
+                *) ((other++)) ;;
+            esac
+        done <<< "$domains"
+        
+        echo "Social Media:  $social"
+        echo "Streaming:     $streaming"
+        echo "Ads/Tracking:  $ads"
+        echo "Google:        $google"
+        echo "Microsoft:     $microsoft"
+        echo "Apple:         $apple"
+        echo "Other:         $other"
+        
+    } | tee "$report_file"
+    
+    echo ""
+    echo -e "${GREEN}✓${NC} Report saved to: ${CYAN}$report_file${NC}"
+}
+
+cmd_list() {
+    echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}           ${BOLD}📁 Saved DNS Captures${NC}                           ${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    
+    if [[ ! -d "$CAPTURE_DIR" ]] || [[ -z "$(ls -A "$CAPTURE_DIR" 2>/dev/null)" ]]; then
+        echo -e "${DIM}No captures found. Run 'sudo dns-traffic capture' to start.${NC}"
+        exit 0
+    fi
+    
+    printf "  ${BOLD}%-30s %10s %15s${NC}\n" "FILENAME" "SIZE" "PACKETS"
+    echo -e "  ${DIM}────────────────────────────────────────────────────────${NC}"
+    
+    for file in "$CAPTURE_DIR"/*.pcap; do
+        [[ ! -f "$file" ]] && continue
+        local name=$(basename "$file")
+        local size=$(du -h "$file" | cut -f1)
+        local packets=$(tcpdump -r "$file" 2>/dev/null | wc -l)
+        printf "  %-30s %10s %15d\n" "$name" "$size" "$packets"
+    done
+}
+
+cmd_devices() {
+    echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}           ${BOLD}📱 Devices with DNS Activity${NC}                     ${BOLD}${CYAN}║${NC}"
+    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    
+    local file=$(ls -t "$CAPTURE_DIR"/*.pcap 2>/dev/null | head -1)
+    if [[ -z "$file" ]]; then
+        echo -e "${DIM}No captures found. Run 'sudo dns-traffic capture' first.${NC}"
+        exit 0
+    fi
+    
+    echo -e "${DIM}From: $(basename "$file")${NC}"
+    echo ""
+    
+    printf "  ${BOLD}%-15s %10s %s${NC}\n" "IP ADDRESS" "QUERIES" "DEVICE NAME"
+    echo -e "  ${DIM}────────────────────────────────────────────────────────${NC}"
+    
+    # Get device IPs and query counts
+    if command -v tshark &>/dev/null; then
+        tshark -r "$file" -Y "dns.flags.response == 0" -T fields -e ip.src 2>/dev/null
+    else
+        tcpdump -r "$file" -n 2>/dev/null | \
+            grep -oE 'IP [0-9.]+\.[0-9]+ >' | \
+            sed 's/IP //' | sed 's/\.[0-9]* >//'
+    fi | sort | uniq -c | sort -rn | head -20 | \
+    while read -r count ip; do
+        # Try to get device name from network-scan
+        local name=""
+        local cache_file="${HOME}/.local/share/network-scan/scan_cache.json"
+        if [[ -f "$cache_file" ]]; then
+            name=$(grep -o "\"ip\":\"$ip\"[^}]*\"display_name\":\"[^\"]*\"" "$cache_file" 2>/dev/null | \
+                   grep -o '"display_name":"[^"]*"' | cut -d'"' -f4 | head -1)
+        fi
+        printf "  %-15s %10d %s\n" "$ip" "$count" "${name:-unknown}"
+    done
+}
+
+#=============================================================================
+# Main
+#=============================================================================
+
+# Parse command
+COMMAND="${1:-}"
+shift || true
+
+# Parse options
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -d|--device)
+            DEVICE_FILTER="$2"
+            shift 2
+            ;;
+        -t|--duration)
+            DURATION="$2"
+            shift 2
+            ;;
+        -f|--file)
+            PCAP_FILE="$2"
+            shift 2
+            ;;
+        -n|--top)
+            TOP_N="$2"
+            shift 2
+            ;;
+        -i|--interface)
+            INTERFACE="$2"
+            shift 2
+            ;;
+        --local)
+            LOCAL_MODE=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo -e "${RED}Unknown option:${NC} $1"
+            exit 1
+            ;;
+    esac
+done
+
+# Resolve device filter to IP if needed
+if [[ -n "$DEVICE_FILTER" ]]; then
+    resolved=$(resolve_device "$DEVICE_FILTER")
+    if [[ -n "$resolved" ]]; then
+        DEVICE_FILTER="$resolved"
+    fi
+fi
+
+# Execute command
+case "$COMMAND" in
+    capture)
+        cmd_capture
+        ;;
+    live)
+        cmd_live
+        ;;
+    analyze)
+        cmd_analyze
+        ;;
+    report)
+        cmd_report
+        ;;
+    list)
+        cmd_list
+        ;;
+    devices)
+        cmd_devices
+        ;;
+    -h|--help|help|"")
+        usage
+        ;;
+    *)
+        echo -e "${RED}Unknown command:${NC} $COMMAND"
+        echo "Run 'dns-traffic --help' for usage."
+        exit 1
+        ;;
+esac

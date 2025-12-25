@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Telegram Bot with commands for presence monitor.
+Telegram Bot with commands for presence monitor and router control.
 """
 
 import urllib.request
 import urllib.parse
 import json
-import threading
-import time
 from typing import Callable, Optional
 from datetime import datetime, timedelta
 import csv
@@ -17,18 +15,31 @@ from pathlib import Path
 class TelegramBot:
     """Telegram bot that handles commands."""
     
-    def __init__(self, bot_token: str, chat_id: str):
+    def __init__(self, bot_token: str, chat_id: str, router_session=None):
+        """Initialize Telegram bot.
+        
+        Args:
+            bot_token: Telegram bot token
+            chat_id: Telegram chat ID to respond to
+            router_session: Optional shared router session to avoid session conflicts
+        """
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.base_url = f"https://api.telegram.org/bot{bot_token}"
         self.last_update_id = 0
         self.running = False
-        self.commands = {}
         self.log_file = Path(__file__).parent / "logs" / "presence_history.csv"
+        self.router_controller = None
+        self._router_session = router_session
+        self._init_router_controller(router_session)
     
-    def register_command(self, command: str, handler: Callable):
-        """Register a command handler."""
-        self.commands[command] = handler
+    def _init_router_controller(self, router_session=None):
+        """Initialize router controller for block/kick commands."""
+        try:
+            from router_control import RouterController
+            self.router_controller = RouterController(shared_session=router_session)
+        except Exception as e:
+            print(f"Router controller not available: {e}")
     
     def send_message(self, message: str, parse_mode: str = "HTML") -> bool:
         """Send a message to the configured chat."""
@@ -89,7 +100,9 @@ class TelegramBot:
         """Handle a bot command."""
         parts = text.split()
         command = parts[0].lower().replace("@", " ").split()[0]  # Remove @botname
+        args = parts[1:] if len(parts) > 1 else []
         
+        # Presence monitor commands
         if command == "/status":
             self._cmd_status(get_status_func)
         elif command == "/stats":
@@ -98,47 +111,87 @@ class TelegramBot:
             self._cmd_today()
         elif command == "/week":
             self._cmd_week()
-        elif command == "/help":
-            self._cmd_help()
         elif command == "/devices":
             self._cmd_devices(get_status_func)
+        elif command == "/help":
+            self._cmd_help()
+        
+        # Router control commands
+        elif command == "/block":
+            self._cmd_block(args)
+        elif command == "/unblock":
+            self._cmd_unblock(args)
+        elif command == "/blocklist":
+            self._cmd_blocklist()
+        elif command == "/kick":
+            self._cmd_kick(args)
+        elif command == "/allow":
+            self._cmd_allow(args)
+        elif command == "/banned":
+            self._cmd_banned()
+    
+    # ==================== HELP ====================
     
     def _cmd_help(self):
         """Show help message."""
         msg = (
             "📱 <b>Phone Presence Monitor</b>\n\n"
-            "<b>Commands:</b>\n"
-            "/status - Current status of all devices\n"
-            "/devices - List monitored devices\n"
+            "<b>📊 Status Commands:</b>\n"
+            "/status - Current device status\n"
+            "/devices - List all devices\n"
             "/stats - Overall statistics\n"
             "/today - Today's activity\n"
-            "/week - This week's summary\n"
+            "/week - This week's summary\n\n"
+            "<b>🌐 Site Blocking:</b>\n"
+            "/block &lt;site&gt; - Block a website\n"
+            "/unblock &lt;site&gt; - Unblock a website\n"
+            "/blocklist - Show blocked sites\n\n"
+            "<b>📵 Device Control:</b>\n"
+            "/kick &lt;device&gt; - Kick device off network\n"
+            "/allow &lt;device&gt; - Allow device back\n"
+            "/banned - Show banned devices\n\n"
             "/help - Show this help"
         )
         self.send_message(msg)
+    
+    # ==================== PRESENCE COMMANDS ====================
     
     def _cmd_status(self, get_status_func: Callable = None):
         """Show current device status."""
         if get_status_func:
             statuses = get_status_func()
-            lines = ["📱 <b>Current Device Status</b>\n"]
-            for name, is_present in statuses.items():
-                icon = "🟢" if is_present else "🔴"
-                status = "Online" if is_present else "Offline"
-                lines.append(f"{icon} {name}: {status}")
+            online = [(n, s) for n, s in statuses.items() if s]
+            offline = [(n, s) for n, s in statuses.items() if not s]
+            
+            lines = [f"📱 <b>Device Status</b> ({len(online)}/{len(statuses)} online)\n"]
+            
+            if online:
+                lines.append("<b>🟢 Online:</b>")
+                for name, _ in sorted(online)[:15]:
+                    lines.append(f"  • {name}")
+                if len(online) > 15:
+                    lines.append(f"  ... and {len(online) - 15} more")
+            
+            if offline and len(offline) <= 10:
+                lines.append("\n<b>🔴 Offline:</b>")
+                for name, _ in sorted(offline):
+                    lines.append(f"  • {name}")
+            
             self.send_message("\n".join(lines))
         else:
             self.send_message("❌ Status not available")
     
     def _cmd_devices(self, get_status_func: Callable = None):
         """List all monitored devices."""
-        from config import DEVICES
-        lines = ["📋 <b>Monitored Devices</b>\n"]
-        for dev in DEVICES:
-            notify = "🔔" if dev.get("notify") else "🔕"
-            lines.append(f"{notify} {dev['name']} ({dev['ip']})")
-        lines.append("\n🔔 = Telegram notifications enabled")
-        self.send_message("\n".join(lines))
+        if get_status_func:
+            statuses = get_status_func()
+            lines = [f"📋 <b>All Devices</b> ({len(statuses)} total)\n"]
+            for name, is_online in sorted(statuses.items()):
+                icon = "🟢" if is_online else "🔴"
+                lines.append(f"{icon} {name}")
+            self.send_message("\n".join(lines[:50]))  # Limit to 50
+        else:
+            self.send_message("❌ Device list not available")
     
     def _cmd_stats(self):
         """Show overall statistics."""
@@ -167,7 +220,7 @@ class TelegramBot:
             return
         
         lines = [f"📅 <b>Today's Activity</b> ({today})\n"]
-        for event in events[-15:]:  # Last 15 events
+        for event in events[-15:]:
             icon = "🟢" if event['event'] == 'arrived' else "🔴"
             lines.append(f"{icon} {event['time']} - {event['phone_name']}")
         
@@ -189,6 +242,114 @@ class TelegramBot:
             lines.append(f"<b>{day}</b>: {stats['arrivals']}↑ {stats['departures']}↓")
         
         self.send_message("\n".join(lines))
+    
+    # ==================== SITE BLOCKING COMMANDS ====================
+    
+    def _cmd_block(self, args: list):
+        """Block a website."""
+        if not self.router_controller:
+            self.send_message("❌ Router control not available")
+            return
+        
+        if not args:
+            self.send_message("Usage: /block &lt;website&gt;\nExample: /block facebook.com")
+            return
+        
+        site = args[0].lower().strip()
+        success, message = self.router_controller.block_site(site)
+        self.send_message(message)
+    
+    def _cmd_unblock(self, args: list):
+        """Unblock a website."""
+        if not self.router_controller:
+            self.send_message("❌ Router control not available")
+            return
+        
+        if not args:
+            self.send_message("Usage: /unblock &lt;website&gt;\nExample: /unblock facebook.com")
+            return
+        
+        site = args[0].lower().strip()
+        success, message = self.router_controller.unblock_site(site)
+        self.send_message(message)
+    
+    def _cmd_blocklist(self):
+        """Show blocked websites."""
+        if not self.router_controller:
+            self.send_message("❌ Router control not available")
+            return
+        
+        success, sites = self.router_controller.get_blocked_sites()
+        
+        if not success:
+            self.send_message("❌ Failed to get blocked sites")
+            return
+        
+        if not sites:
+            self.send_message("🌐 <b>Blocked Sites</b>\n\nNo sites are currently blocked.")
+            return
+        
+        lines = [f"🌐 <b>Blocked Sites</b> ({len(sites)})\n"]
+        for site in sites:
+            lines.append(f"🚫 {site}")
+        
+        self.send_message("\n".join(lines))
+    
+    # ==================== DEVICE CONTROL COMMANDS ====================
+    
+    def _cmd_kick(self, args: list):
+        """Kick a device off the network."""
+        if not self.router_controller:
+            self.send_message("❌ Router control not available")
+            return
+        
+        if not args:
+            self.send_message("Usage: /kick &lt;device_name&gt;\nExample: /kick Samsung")
+            return
+        
+        device = " ".join(args)
+        success, message = self.router_controller.kick_device(device)
+        self.send_message(message)
+    
+    def _cmd_allow(self, args: list):
+        """Allow a device back on the network."""
+        if not self.router_controller:
+            self.send_message("❌ Router control not available")
+            return
+        
+        if not args:
+            self.send_message("Usage: /allow &lt;device_name&gt;\nExample: /allow Samsung")
+            return
+        
+        device = " ".join(args)
+        success, message = self.router_controller.allow_device(device)
+        self.send_message(message)
+    
+    def _cmd_banned(self):
+        """Show banned devices."""
+        if not self.router_controller:
+            self.send_message("❌ Router control not available")
+            return
+        
+        success, devices = self.router_controller.get_blocked_devices()
+        
+        if not success:
+            self.send_message("❌ Failed to get banned devices")
+            return
+        
+        if not devices:
+            self.send_message("📵 <b>Banned Devices</b>\n\nNo devices are currently banned.")
+            return
+        
+        lines = [f"📵 <b>Banned Devices</b> ({len(devices)})\n"]
+        for dev in devices:
+            name = dev.get('name', 'Unknown')
+            mac = dev.get('mac', '')
+            lines.append(f"🚫 {name} ({mac})")
+        
+        self.send_message("\n".join(lines))
+    
+    # ==================== HELPER METHODS ====================
     
     def _get_stats(self) -> dict:
         """Get overall statistics from log file."""
@@ -243,7 +404,6 @@ class TelegramBot:
         if not self.log_file.exists():
             return {}
         
-        # Get last 7 days
         dates = {}
         for i in range(7):
             d = datetime.now() - timedelta(days=i)
@@ -263,7 +423,6 @@ class TelegramBot:
         except Exception:
             pass
         
-        # Convert to ordered dict by day name
         result = {}
         for date_str in sorted(dates.keys(), reverse=True):
             info = dates[date_str]

@@ -56,7 +56,6 @@ class RouterBasedMonitor:
     def __init__(self):
         self.devices: Dict[str, DeviceTracker] = {}  # keyed by MAC
         self.notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-        self.bot = TelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
         self.logger = PresenceLogger()
         self.running = False
         self.check_count = 0
@@ -69,6 +68,15 @@ class RouterBasedMonitor:
         except Exception as e:
             self._log(f"Error: Could not initialize router client: {e}")
             sys.exit(1)
+        
+        # Login to router first so we have a session to share
+        if not self.router_client.login():
+            self._log("Warning: Initial router login failed, will retry later")
+        
+        # Initialize telegram bot with shared router session to avoid session conflicts
+        # The router only allows one active session at a time
+        router_session = self.router_client.session if self.router_client else None
+        self.bot = TelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, router_session=router_session)
     
     def _log(self, message: str):
         """Print timestamped log message."""

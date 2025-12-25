@@ -1,134 +1,93 @@
 # Phone Presence Monitor
 
-A Python application that monitors your phone's presence on the local network and sends Telegram notifications when the phone connects or disconnects.
+Monitors device presence on the network using the VOO router API and sends Telegram notifications.
 
 ## Features
 
-- 📱 Monitors phone presence via network ping
-- 📬 Sends Telegram notifications on state changes
-- 🔄 Continuous monitoring with configurable intervals
-- 🖥️ Cross-platform (Linux, macOS, Windows)
+- **Auto-discovers** all devices from router
+- **Logs arrivals/departures** to CSV for statistics
+- **Sends Telegram notifications** for specified devices
+- **Router control** - block/unblock sites and devices
+- Runs as a **systemd service**
 
-## Setup
+## Telegram Bot Commands
 
-### 1. Create a Telegram Bot
+### Presence Monitoring
+| Command | Description |
+|---------|-------------|
+| `/status` | Current device status |
+| `/stats` | Presence statistics |
+| `/today` | Today's activity |
+| `/week` | This week's summary |
+| `/devices` | List all devices |
+| `/help` | Show all commands |
 
-1. Open Telegram and search for `@BotFather`
-2. Send `/newbot` and follow the instructions
-3. Copy the bot token you receive
+### Site Blocking
+| Command | Description |
+|---------|-------------|
+| `/block <site>` | Block a website (e.g., `/block facebook.com`) |
+| `/unblock <site>` | Unblock a website |
+| `/blocklist` | Show blocked sites |
 
-### 2. Get Your Chat ID
+### Device Control
+| Command | Description |
+|---------|-------------|
+| `/kick <device>` | Kick device off network (by name) |
+| `/allow <device>` | Allow device back on network |
+| `/banned` | Show blocked/kicked devices |
 
-1. Search for `@userinfobot` or `@get_id_bot` on Telegram
-2. Start a chat and it will show your chat ID
-3. Copy your chat ID
+## Files
 
-### 3. Configure the App
+| File | Description |
+|------|-------------|
+| `monitor.py` | Main monitor service |
+| `telegram_bot.py` | Telegram bot with commands |
+| `telegram_notifier.py` | Simple notification sender |
+| `router_client.py` | VOO router API client (read-only) |
+| `router_control.py` | VOO router control (block/kick) |
+| `presence_detector.py` | Device presence detection logic |
+| `presence_logger.py` | CSV logging for statistics |
+| `config.example.py` | Example configuration |
+| `phone-monitor.service` | Systemd service file |
 
-Edit `config.py` and fill in your details:
+## Installation
 
-```python
-# Telegram Bot Configuration
-TELEGRAM_BOT_TOKEN = "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"  # Your bot token
-TELEGRAM_CHAT_ID = "123456789"  # Your chat ID
+1. Copy files to your server:
+   ```bash
+   mkdir -p ~/phone-presence-monitor
+   cp *.py ~/phone-presence-monitor/
+   ```
 
-# Phone to monitor
-PHONE_IP = "192.168.0.183"  # Already configured for your Redmi
-PHONE_NAME = "Redmi Note 12 Pro 5G"
+2. Create configuration:
+   ```bash
+   cp config.example.py config.py
+   # Edit config.py with your settings
+   ```
 
-# Check interval in seconds
-CHECK_INTERVAL = 30
-```
+3. Install dependencies:
+   ```bash
+   pip install requests
+   ```
 
-### 4. Run the Monitor
+4. Set up systemd service:
+   ```bash
+   sudo cp phone-monitor.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable phone-monitor
+   sudo systemctl start phone-monitor
+   ```
 
-```bash
-cd phone_presence_monitor
-python3 monitor.py
-```
+## Configuration
 
-## Running as a Background Service
+Edit `config.py` with:
+- `TELEGRAM_BOT_TOKEN` - Your Telegram bot token
+- `TELEGRAM_CHAT_ID` - Your Telegram chat ID
+- `ROUTER_URL` - Router URL (default: http://192.168.0.1)
+- `ROUTER_USERNAME` - Router admin username
+- `ROUTER_PASSWORD` - Router admin password
+- `TRACKED_DEVICES` - List of device names to track
 
-### Linux (systemd)
+## Router Compatibility
 
-Create `/etc/systemd/system/phone-monitor.service`:
-
-```ini
-[Unit]
-Description=Phone Presence Monitor
-After=network.target
-
-[Service]
-Type=simple
-User=your_username
-WorkingDirectory=/path/to/phone_presence_monitor
-ExecStart=/usr/bin/python3 monitor.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable phone-monitor
-sudo systemctl start phone-monitor
-```
-
-### macOS (launchd)
-
-Create `~/Library/LaunchAgents/com.phone.monitor.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.phone.monitor</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/bin/python3</string>
-        <string>/path/to/phone_presence_monitor/monitor.py</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>WorkingDirectory</key>
-    <string>/path/to/phone_presence_monitor</string>
-</dict>
-</plist>
-```
-
-Then:
-```bash
-launchctl load ~/Library/LaunchAgents/com.phone.monitor.plist
-```
-
-## How It Works
-
-1. The app pings your phone's IP address at regular intervals
-2. If the phone responds, it's considered "present" on the network
-3. When the state changes (present → absent or absent → present), a Telegram notification is sent
-4. The app handles network fluctuations by requiring multiple failed pings before declaring the phone absent
-
-## Configuration Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `TELEGRAM_BOT_TOKEN` | Your Telegram bot token | Required |
-| `TELEGRAM_CHAT_ID` | Your Telegram chat ID | Required |
-| `PHONE_IP` | IP address of the phone | `192.168.0.183` |
-| `PHONE_NAME` | Display name for notifications | `Redmi Note 12 Pro 5G` |
-| `CHECK_INTERVAL` | Seconds between checks | `30` |
-| `PING_TIMEOUT` | Ping timeout in seconds | `2` |
-| `PING_ATTEMPTS` | Number of ping attempts | `3` |
-
-## Troubleshooting
-
-- **Phone not detected**: Make sure the phone has a static IP or DHCP reservation
-- **Telegram not working**: Verify your bot token and chat ID are correct
-- **Permission denied**: On some systems, ping may require elevated privileges
+Tested with VOO Technicolor routers using PBKDF2 authentication.
+May work with other Technicolor routers with similar APIs.

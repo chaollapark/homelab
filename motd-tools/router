@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""
+VOO Router Control CLI
+
+Local command-line tool for managing the VOO Technicolor router.
+Works offline (no internet needed) - connects directly to router at 192.168.0.1
+
+Usage:
+    router                     # Show help
+    router devices             # List all devices from router
+    router blocked             # Show blocked sites and devices
+    router block <site>        # Block a website
+    router unblock <site>      # Unblock a website  
+    router kick <device>       # Kick device off network (by name)
+    router allow <device>      # Allow device back on network
+"""
+
+import sys
+import argparse
+from pathlib import Path
+
+# Add the telegramapp path for imports
+sys.path.insert(0, str(Path.home() / "code" / "telegramapp" / "phone_presence_monitor"))
+
+try:
+    from router_control import RouterController
+    ROUTER_AVAILABLE = True
+except ImportError:
+    ROUTER_AVAILABLE = False
+
+# Also import VooRouter for device listing
+sys.path.insert(0, str(Path.home() / "bin"))
+
+
+def print_help():
+    """Print comprehensive help message."""
+    help_text = """
+\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m
+\033[1m🌐 VOO Router Control - Local CLI Tool\033[0m
+\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m
+
+\033[1;33mℹ️  Works offline - connects directly to router (no internet needed)\033[0m
+
+\033[1mDEVICE COMMANDS:\033[0m
+  \033[1;32mrouter devices\033[0m              List all devices connected to router
+  \033[1;32mrouter devices --active\033[0m     List only currently active devices
+  \033[1;32mrouter kick <name>\033[0m          Block a device by name (partial match)
+  \033[1;32mrouter allow <name>\033[0m         Unblock a device by name
+  \033[1;32mrouter banned\033[0m               Show blocked/kicked devices
+
+\033[1mSITE BLOCKING:\033[0m
+  \033[1;32mrouter block <site>\033[0m         Block a website (e.g., facebook.com)
+  \033[1;32mrouter unblock <site>\033[0m       Unblock a website
+  \033[1;32mrouter sites\033[0m                Show blocked websites
+
+\033[1mSTATUS:\033[0m
+  \033[1;32mrouter status\033[0m               Show router connection status
+  \033[1;32mrouter blocked\033[0m              Show all blocked sites AND devices
+
+\033[1mEXAMPLES:\033[0m
+  router kick samsung          # Kick device with 'samsung' in name
+  router allow manik           # Allow Manik's device back
+  router block tiktok.com      # Block TikTok
+  router unblock youtube.com   # Unblock YouTube
+
+\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m
+\033[1mTelegram Bot Commands:\033[0m (when internet is available)
+  /status, /devices, /kick, /allow, /block, /unblock, /banned, /help
+\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m
+"""
+    print(help_text)
+
+
+def cmd_devices(active_only=False):
+    """List devices from router."""
+    try:
+        # Import VooRouter - read and exec the script
+        import requests
+        import hashlib
+        import configparser
+        
+        CONFIG_DIR = Path.home() / "bin" / "config"
+        CONFIG_FILE = CONFIG_DIR / "router.conf"
+        
+        config = configparser.ConfigParser()
+        config.read(CONFIG_FILE)
+        
+        router_url = config.get('router', 'url', fallback='http://192.168.0.1')
+        username = config.get('router', 'username', fallback='')
+        password = config.get('router', 'password', fallback='')
+        
+        def pbkdf2_hex(pwd, salt, iterations=1000, key_length=16):
+            return hashlib.pbkdf2_hmac('sha256', pwd.encode(), salt.encode(), iterations, dklen=key_length).hex()
+        
+        def get_connection_type(device):
+            interface = device.get("layer1interface", "").lower()
+            if "wifi" in interface:
+                if "ssid.1" in interface:
+                    return "WiFi 2.4G"
+                elif "ssid.2" in interface:
+                    return "WiFi 5G"
+                return "WiFi"
+            elif "ethernet" in interface:
+                return "Ethernet"
+            return interface or "Unknown"
+        
+        # Create session and login
+        session = requests.Session()
+        session.headers.update({'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest'})
+        session.get(f"{router_url}/", timeout=10)
+        session.get(f"{router_url}/api/v1/session/menu", timeout=10)
+        
+        resp = session.post(f"{router_url}/api/v1/session/login", data={"username": username, "password": "seeksalthash"}, timeout=10)
+        data = resp.json()
+        if data.get("error") != "ok":
+            print("\033[1;31m✗ Failed to connect to router\033[0m")
+            return False
+        
+        salt, salt_webui = data.get("salt", ""), data.get("saltwebui", "")
+        final_password = password if salt == "none" else pbkdf2_hex(pbkdf2_hex(password, salt), salt_webui)
+        
+        resp = session.post(f"{router_url}/api/v1/session/login", data={"username": username, "password": final_password}, timeout=10)
+        if resp.json().get("error") != "ok":
+            print("\033[1;31m✗ Failed to connect to router\033[0m")
+            return False
+        
+        session.headers.update({'X-CSRF-TOKEN': session.cookies.get("auth", "")})
+        session.get(f"{router_url}/api/v1/session/menu", timeout=10)
+        
+        try:
+            resp = session.get(f"{router_url}/api/v1/host", timeout=30)
+            data = resp.json()
+            devices = data.get("data", {}).get("hostTbl", []) if data.get("error") == "ok" else []
+            
+            if not devices:
+                print("No devices found")
+                return True
+            
+            if active_only:
+                devices = [d for d in devices if d.get("active") == "true"]
+            
+            print(f"\n\033[1m{'MAC Address':<20} {'IP Address':<16} {'Hostname':<28} {'Connection':<12} {'Active'}\033[0m")
+            print("=" * 90)
+            
+            for d in sorted(devices, key=lambda x: x.get("ipaddress", "")):
+                mac = d.get("physaddress", "N/A").upper()
+                ip = d.get("ipaddress", "N/A")
+                hostname = d.get("hostname", "N/A")[:27]
+                conn = get_connection_type(d)[:11]
+                active = "✓" if d.get("active") == "true" else ""
+                
+                print(f"{mac:<20} {ip:<16} {hostname:<28} {conn:<12} {active}")
+            
+            print(f"\nTotal: {len(devices)} devices")
+            if not active_only:
+                active_count = sum(1 for d in devices if d.get("active") == "true")
+                print(f"Active: {active_count} devices")
+            
+            return True
+        finally:
+            session.post(f"{router_url}/api/v1/session/logout", timeout=5)
+            
+    except Exception as e:
+        print(f"\033[1;31m✗ Error: {e}\033[0m")
+        return False
+
+
+def cmd_banned():
+    """Show blocked/kicked devices."""
+    if not ROUTER_AVAILABLE:
+        print("\033[1;31m✗ Router control module not available\033[0m")
+        return False
+    
+    rc = RouterController()
+    try:
+        success, blocked = rc.get_blocked_devices()
+        if not success:
+            print("\033[1;31m✗ Failed to get blocked devices\033[0m")
+            return False
+        
+        print("\n\033[1m🚫 Blocked Devices (MAC Filter):\033[0m")
+        if blocked:
+            for d in blocked:
+                mac = d.get("macaddress", "N/A")
+                desc = d.get("description", "No name")
+                print(f"  {mac} - {desc}")
+        else:
+            print("  \033[1;32m(none)\033[0m")
+        
+        return True
+    finally:
+        rc.logout()
+
+
+def cmd_sites():
+    """Show blocked websites."""
+    if not ROUTER_AVAILABLE:
+        print("\033[1;31m✗ Router control module not available\033[0m")
+        return False
+    
+    rc = RouterController()
+    try:
+        success, sites = rc.get_blocked_sites()
+        if not success:
+            print("\033[1;31m✗ Failed to get blocked sites\033[0m")
+            return False
+        
+        print("\n\033[1m🌐 Blocked Websites:\033[0m")
+        if sites:
+            for site in sites:
+                print(f"  🚫 {site}")
+        else:
+            print("  \033[1;32m(none)\033[0m")
+        
+        return True
+    finally:
+        rc.logout()
+
+
+def cmd_blocked():
+    """Show all blocked sites and devices."""
+    success1 = cmd_sites()
+    print()
+    success2 = cmd_banned()
+    return success1 and success2
+
+
+def cmd_kick(device_name):
+    """Kick a device off the network."""
+    if not ROUTER_AVAILABLE:
+        print("\033[1;31m✗ Router control module not available\033[0m")
+        return False
+    
+    if not device_name:
+        print("\033[1;31m✗ Usage: router kick <device_name>\033[0m")
+        print("  Example: router kick samsung")
+        return False
+    
+    rc = RouterController()
+    try:
+        success, message = rc.kick_device(device_name)
+        print(message)
+        return success
+    finally:
+        rc.logout()
+
+
+def cmd_allow(device_name):
+    """Allow a device back on the network."""
+    if not ROUTER_AVAILABLE:
+        print("\033[1;31m✗ Router control module not available\033[0m")
+        return False
+    
+    if not device_name:
+        print("\033[1;31m✗ Usage: router allow <device_name>\033[0m")
+        print("  Example: router allow samsung")
+        return False
+    
+    rc = RouterController()
+    try:
+        success, message = rc.allow_device(device_name)
+        print(message)
+        return success
+    finally:
+        rc.logout()
+
+
+def cmd_block_site(site):
+    """Block a website."""
+    if not ROUTER_AVAILABLE:
+        print("\033[1;31m✗ Router control module not available\033[0m")
+        return False
+    
+    if not site:
+        print("\033[1;31m✗ Usage: router block <website>\033[0m")
+        print("  Example: router block facebook.com")
+        return False
+    
+    rc = RouterController()
+    try:
+        success, message = rc.block_site(site)
+        print(message)
+        return success
+    finally:
+        rc.logout()
+
+
+def cmd_unblock_site(site):
+    """Unblock a website."""
+    if not ROUTER_AVAILABLE:
+        print("\033[1;31m✗ Router control module not available\033[0m")
+        return False
+    
+    if not site:
+        print("\033[1;31m✗ Usage: router unblock <website>\033[0m")
+        print("  Example: router unblock facebook.com")
+        return False
+    
+    rc = RouterController()
+    try:
+        success, message = rc.unblock_site(site)
+        print(message)
+        return success
+    finally:
+        rc.logout()
+
+
+def cmd_status():
+    """Show router connection status."""
+    if not ROUTER_AVAILABLE:
+        print("\033[1;31m✗ Router control module not available\033[0m")
+        return False
+    
+    rc = RouterController()
+    try:
+        if rc._ensure_logged_in():
+            print("\033[1;32m✓ Connected to router at 192.168.0.1\033[0m")
+            return True
+        else:
+            print("\033[1;31m✗ Cannot connect to router\033[0m")
+            return False
+    finally:
+        rc.logout()
+
+
+def main():
+    if len(sys.argv) < 2:
+        print_help()
+        return 0
+    
+    command = sys.argv[1].lower()
+    args = sys.argv[2:] if len(sys.argv) > 2 else []
+    
+    # Parse commands
+    if command in ['-h', '--help', 'help']:
+        print_help()
+        return 0
+    
+    elif command == 'devices':
+        active_only = '--active' in args or '-a' in args
+        success = cmd_devices(active_only)
+        return 0 if success else 1
+    
+    elif command == 'banned':
+        success = cmd_banned()
+        return 0 if success else 1
+    
+    elif command == 'sites':
+        success = cmd_sites()
+        return 0 if success else 1
+    
+    elif command == 'blocked':
+        success = cmd_blocked()
+        return 0 if success else 1
+    
+    elif command == 'kick':
+        device_name = ' '.join(args) if args else None
+        success = cmd_kick(device_name)
+        return 0 if success else 1
+    
+    elif command == 'allow':
+        device_name = ' '.join(args) if args else None
+        success = cmd_allow(device_name)
+        return 0 if success else 1
+    
+    elif command == 'block':
+        site = args[0] if args else None
+        success = cmd_block_site(site)
+        return 0 if success else 1
+    
+    elif command == 'unblock':
+        site = args[0] if args else None
+        success = cmd_unblock_site(site)
+        return 0 if success else 1
+    
+    elif command == 'status':
+        success = cmd_status()
+        return 0 if success else 1
+    
+    else:
+        print(f"\033[1;31m✗ Unknown command: {command}\033[0m")
+        print("Run 'router --help' for usage.")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
