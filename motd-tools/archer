@@ -1,0 +1,407 @@
+#!/home/madan/bin/venv-archer/bin/python3
+"""
+Archer WiFi Controller - Manage TP-Link Archer C80 Access Points
+
+Commands:
+    archer status           Show status of all APs
+    archer devices          List connected devices on all APs
+    archer wifi on|off      Turn WiFi on/off on all APs
+    archer wifi on|off -a N Turn WiFi on/off on specific AP
+    archer reboot [-a N]    Reboot AP(s)
+    archer list             List configured APs
+"""
+
+import sys
+import argparse
+import configparser
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Optional, Tuple
+
+try:
+    from tplinkrouterc6u import TplinkC80Router, Connection
+except ImportError:
+    print("Error: tplinkrouterc6u not installed")
+    print("Run: ~/bin/venv-archer/bin/pip install tplinkrouterc6u")
+    sys.exit(1)
+
+
+# ANSI colors
+class C:
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    RED = '\033[0;31m'
+    GREEN = '\033[0;32m'
+    YELLOW = '\033[1;33m'
+    BLUE = '\033[0;34m'
+    CYAN = '\033[0;36m'
+    BRED = '\033[1;31m'
+    BGREEN = '\033[1;32m'
+    BCYAN = '\033[1;36m'
+
+
+# Configuration
+CONFIG_FILE = Path.home() / "bin" / "config" / "archer.conf"
+DEFAULT_PASSWORD = "admin"
+
+
+def load_config() -> Dict:
+    """Load AP configuration from config file."""
+    config = configparser.ConfigParser()
+    
+    if not CONFIG_FILE.exists():
+        # Return default config with discovered APs
+        return {
+            'aps': [
+                {'name': 'AP1', 'url': 'http://192.168.0.128', 'password': DEFAULT_PASSWORD},
+                {'name': 'AP2', 'url': 'http://192.168.0.110', 'password': DEFAULT_PASSWORD},
+                {'name': 'AP3', 'url': 'http://192.168.0.99', 'password': DEFAULT_PASSWORD},
+                {'name': 'AP4', 'url': 'http://192.168.0.216', 'password': DEFAULT_PASSWORD},
+            ]
+        }
+    
+    config.read(CONFIG_FILE)
+    aps = []
+    
+    # Read AP configurations
+    default_password = config.get('default', 'password', fallback=DEFAULT_PASSWORD)
+    
+    for section in config.sections():
+        if section.startswith('ap'):
+            ap = {
+                'name': config.get(section, 'name', fallback=section.upper()),
+                'url': config.get(section, 'url', fallback=''),
+                'password': config.get(section, 'password', fallback=default_password),
+            }
+            if ap['url']:
+                aps.append(ap)
+    
+    return {'aps': aps}
+
+
+def get_ap_status(ap: Dict) -> Dict:
+    """Get status from a single AP."""
+    result = {
+        'name': ap['name'],
+        'url': ap['url'],
+        'online': False,
+        'error': None,
+    }
+    
+    try:
+        router = TplinkC80Router(ap['url'], ap['password'])
+        router.authorize()
+    except Exception as e:
+        result['error'] = f"Auth failed: {e}"
+        return result
+    
+    try:
+        try:
+            status = router.get_status()
+            firmware = router.get_firmware()
+            result.update({
+                'online': True,
+                'wifi_2g': getattr(status, 'wifi_2g_enable', None),
+                'wifi_5g': getattr(status, 'wifi_5g_enable', None),
+                'guest_2g': getattr(status, 'guest_2g_enable', None),
+                'guest_5g': getattr(status, 'guest_5g_enable', None),
+                'clients': getattr(status, 'clients_total', 0),
+                'wifi_clients': getattr(status, 'wifi_clients_total', 0),
+                'mem_usage': getattr(status, 'mem_usage', None),
+                'model': getattr(firmware, 'model', 'Unknown'),
+                'firmware': getattr(firmware, 'firmware_version', 'Unknown'),
+            })
+        finally:
+            router.logout()
+    except Exception as e:
+        result['error'] = f"API error: {e}"
+
+    return result
+
+
+def get_ap_devices(ap: Dict) -> Dict:
+    """Get connected devices from a single AP."""
+    result = {
+        'name': ap['name'],
+        'url': ap['url'],
+        'online': False,
+        'devices': [],
+        'error': None,
+    }
+    
+    try:
+        router = TplinkC80Router(ap['url'], ap['password'])
+        router.authorize()
+        try:
+            leases = router.get_ipv4_dhcp_leases()
+            result['online'] = True
+            result['devices'] = [
+                {
+                    'hostname': getattr(d, 'hostname', 'Unknown'),
+                    'ip': str(getattr(d, 'ipaddr', '')),
+                    'mac': str(getattr(d, 'macaddr', '')),
+                }
+                for d in leases
+            ]
+        finally:
+            router.logout()
+    except Exception as e:
+        result['error'] = str(e)
+    
+    return result
+
+
+def set_ap_wifi(ap: Dict, enable: bool) -> Dict:
+    """Turn WiFi on/off on a single AP."""
+    result = {
+        'name': ap['name'],
+        'url': ap['url'],
+        'success': False,
+        'error': None,
+    }
+    
+    try:
+        router = TplinkC80Router(ap['url'], ap['password'])
+        router.authorize()
+        try:
+            # Turn on/off both 2.4G and 5G
+            router.set_wifi(Connection.HOST_2G, enable)
+            router.set_wifi(Connection.HOST_5G, enable)
+            result['success'] = True
+        finally:
+            router.logout()
+    except Exception as e:
+        result['error'] = str(e)
+    
+    return result
+
+
+def reboot_ap(ap: Dict) -> Dict:
+    """Reboot a single AP."""
+    result = {
+        'name': ap['name'],
+        'url': ap['url'],
+        'success': False,
+        'error': None,
+    }
+    
+    try:
+        router = TplinkC80Router(ap['url'], ap['password'])
+        router.authorize()
+        try:
+            router.reboot()
+            result['success'] = True
+        finally:
+            try:
+                router.logout()
+            except:
+                pass  # May fail if rebooting
+    except Exception as e:
+        result['error'] = str(e)
+    
+    return result
+
+
+def run_parallel(func, aps: List[Dict]) -> List[Dict]:
+    """Run a function on multiple APs in parallel."""
+    results = []
+    with ThreadPoolExecutor(max_workers=len(aps)) as executor:
+        futures = {executor.submit(func, ap): ap for ap in aps}
+        for future in as_completed(futures):
+            results.append(future.result())
+    # Sort by name
+    results.sort(key=lambda x: x['name'])
+    return results
+
+
+def cmd_list(args, config):
+    """List configured APs."""
+    print(f"\n{C.BCYAN}📡 Configured Access Points{C.RESET}\n")
+    print(f"  {C.DIM}#  Name          URL{C.RESET}")
+    print(f"  {C.DIM}{'─' * 45}{C.RESET}")
+    
+    for i, ap in enumerate(config['aps'], 1):
+        print(f"  {i}  {ap['name']:12}  {ap['url']}")
+    
+    print(f"\n  {C.DIM}Config: {CONFIG_FILE}{C.RESET}\n")
+
+
+def cmd_status(args, config):
+    """Show status of all APs."""
+    aps = config['aps']
+    if args.ap:
+        aps = [aps[args.ap - 1]] if 0 < args.ap <= len(aps) else []
+    
+    if not aps:
+        print(f"{C.RED}No APs found{C.RESET}")
+        return
+    
+    print(f"\n{C.BCYAN}📡 Access Point Status{C.RESET}\n")
+    
+    results = run_parallel(get_ap_status, aps)
+    
+    for r in results:
+        if r['online']:
+            wifi_2g = f"{C.GREEN}ON{C.RESET}" if r.get('wifi_2g') else f"{C.RED}OFF{C.RESET}"
+            wifi_5g = f"{C.GREEN}ON{C.RESET}" if r.get('wifi_5g') else f"{C.RED}OFF{C.RESET}"
+            mem = f"{r['mem_usage']*100:.0f}%" if r.get('mem_usage') else 'N/A'
+            
+            print(f"  {C.BGREEN}●{C.RESET} {C.BOLD}{r['name']}{C.RESET} ({r['url'].replace('http://', '')})")
+            print(f"    {C.DIM}Model:{C.RESET} {r.get('model', 'Unknown')}")
+            print(f"    {C.DIM}WiFi:{C.RESET}  2.4G={wifi_2g}  5G={wifi_5g}")
+            print(f"    {C.DIM}Clients:{C.RESET} {r.get('clients', 0)} ({r.get('wifi_clients', 0)} wireless)")
+            print(f"    {C.DIM}Memory:{C.RESET} {mem}")
+        else:
+            print(f"  {C.RED}●{C.RESET} {C.BOLD}{r['name']}{C.RESET} ({r['url'].replace('http://', '')})")
+            print(f"    {C.RED}Offline: {r.get('error', 'Unknown error')}{C.RESET}")
+        print()
+
+
+def cmd_devices(args, config):
+    """List connected devices."""
+    aps = config['aps']
+    if args.ap:
+        aps = [aps[args.ap - 1]] if 0 < args.ap <= len(aps) else []
+    
+    if not aps:
+        print(f"{C.RED}No APs found{C.RESET}")
+        return
+    
+    print(f"\n{C.BCYAN}📱 Connected Devices{C.RESET}\n")
+    
+    results = run_parallel(get_ap_devices, aps)
+    
+    for r in results:
+        if r['online']:
+            print(f"  {C.BGREEN}●{C.RESET} {C.BOLD}{r['name']}{C.RESET} - {len(r['devices'])} devices")
+            for d in sorted(r['devices'], key=lambda x: x['ip']):
+                print(f"    {d['ip']:16} {d['hostname'][:30]:30} {C.DIM}{d['mac']}{C.RESET}")
+        else:
+            print(f"  {C.RED}●{C.RESET} {C.BOLD}{r['name']}{C.RESET} - Offline")
+            print(f"    {C.RED}{r.get('error', 'Unknown error')}{C.RESET}")
+        print()
+
+
+def cmd_wifi(args, config):
+    """Turn WiFi on/off."""
+    if not args.state:
+        print(f"{C.RED}Usage: archer wifi on|off [-a N]{C.RESET}")
+        return
+    
+    enable = args.state.lower() == 'on'
+    aps = config['aps']
+    
+    if args.ap:
+        aps = [aps[args.ap - 1]] if 0 < args.ap <= len(aps) else []
+    
+    if not aps:
+        print(f"{C.RED}No APs found{C.RESET}")
+        return
+    
+    action = "Turning ON" if enable else "Turning OFF"
+    print(f"\n{C.BCYAN}📡 {action} WiFi on {len(aps)} AP(s)...{C.RESET}\n")
+    
+    results = run_parallel(lambda ap: set_ap_wifi(ap, enable), aps)
+    
+    for r in results:
+        if r['success']:
+            status = f"{C.BGREEN}ON{C.RESET}" if enable else f"{C.BRED}OFF{C.RESET}"
+            print(f"  {C.GREEN}✓{C.RESET} {r['name']}: WiFi {status}")
+        else:
+            print(f"  {C.RED}✗{C.RESET} {r['name']}: {r.get('error', 'Failed')}")
+    
+    print()
+
+
+def cmd_reboot(args, config):
+    """Reboot AP(s)."""
+    aps = config['aps']
+    
+    if args.ap:
+        aps = [aps[args.ap - 1]] if 0 < args.ap <= len(aps) else []
+    elif not args.all:
+        print(f"{C.YELLOW}Specify -a N for specific AP or --all for all APs{C.RESET}")
+        return
+    
+    if not aps:
+        print(f"{C.RED}No APs found{C.RESET}")
+        return
+    
+    print(f"\n{C.BCYAN}🔄 Rebooting {len(aps)} AP(s)...{C.RESET}\n")
+    
+    results = run_parallel(reboot_ap, aps)
+    
+    for r in results:
+        if r['success']:
+            print(f"  {C.GREEN}✓{C.RESET} {r['name']}: Rebooting...")
+        else:
+            print(f"  {C.RED}✗{C.RESET} {r['name']}: {r.get('error', 'Failed')}")
+    
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Archer WiFi Controller - Manage TP-Link Archer C80 Access Points',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  archer status              Show status of all APs
+  archer devices             List connected devices
+  archer wifi off            Turn OFF WiFi on ALL APs
+  archer wifi on             Turn ON WiFi on ALL APs
+  archer wifi off -a 2       Turn OFF WiFi on AP #2 only
+  archer reboot -a 1         Reboot AP #1
+  archer reboot --all        Reboot all APs
+  archer list                List configured APs
+"""
+    )
+    
+    parser.add_argument('-a', '--ap', type=int, metavar='N',
+                        help='Target specific AP number (1-4)')
+    
+    subparsers = parser.add_subparsers(dest='command', help='Command')
+    
+    # status
+    sub_status = subparsers.add_parser('status', help='Show AP status')
+    
+    # devices
+    sub_devices = subparsers.add_parser('devices', help='List connected devices')
+    
+    # wifi
+    sub_wifi = subparsers.add_parser('wifi', help='Control WiFi (on/off)')
+    sub_wifi.add_argument('state', nargs='?', choices=['on', 'off'],
+                          help='Turn WiFi on or off')
+    
+    # reboot
+    sub_reboot = subparsers.add_parser('reboot', help='Reboot AP(s)')
+    sub_reboot.add_argument('--all', action='store_true',
+                            help='Reboot all APs')
+    
+    # list
+    sub_list = subparsers.add_parser('list', help='List configured APs')
+    
+    args = parser.parse_args()
+    config = load_config()
+    
+    if not config['aps']:
+        print(f"{C.RED}No APs configured. Create {CONFIG_FILE}{C.RESET}")
+        sys.exit(1)
+    
+    commands = {
+        'status': cmd_status,
+        'devices': cmd_devices,
+        'wifi': cmd_wifi,
+        'reboot': cmd_reboot,
+        'list': cmd_list,
+    }
+    
+    if args.command in commands:
+        commands[args.command](args, config)
+    else:
+        parser.print_help()
+
+
+if __name__ == '__main__':
+    main()

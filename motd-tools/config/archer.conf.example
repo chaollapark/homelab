@@ -1,0 +1,26 @@
+# Archer C80 Access Points Configuration
+# Edit passwords below to match your AP admin passwords
+
+[default]
+# Default password for all APs (if not specified per-AP)
+password = admin
+
+[ap1]
+name = AP1 (Living)
+url = http://192.168.0.128
+# password = your_password_here
+
+[ap2]
+name = AP2 (Bedroom)
+url = http://192.168.0.110
+# password = your_password_here
+
+[ap3]
+name = AP3 (Office)
+url = http://192.168.0.99
+# password = your_password_here
+
+[ap4]
+name = AP4 (Garage)
+url = http://192.168.0.216
+# password = your_password_here
