@@ -6,10 +6,26 @@ Telegram Bot with commands for presence monitor and router control.
 import urllib.request
 import urllib.parse
 import json
+import logging
 from typing import Callable, Optional
 from datetime import datetime, timedelta
 import csv
 from pathlib import Path
+
+
+# Setup logging for telegram commands
+LOG_DIR = Path(__file__).parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+CMD_LOG_FILE = LOG_DIR / "telegram_commands.log"
+
+logging.basicConfig(level=logging.INFO)
+cmd_logger = logging.getLogger("telegram_commands")
+cmd_handler = logging.FileHandler(CMD_LOG_FILE)
+cmd_handler.setFormatter(logging.Formatter(
+    '%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+cmd_logger.addHandler(cmd_handler)
 
 
 class TelegramBot:
@@ -101,6 +117,9 @@ class TelegramBot:
         parts = text.split()
         command = parts[0].lower().replace("@", " ").split()[0]  # Remove @botname
         args = parts[1:] if len(parts) > 1 else []
+        
+        # Log the command
+        cmd_logger.info(f"CMD: {command} {' '.join(args) if args else ''}")
         
         # Presence monitor commands
         if command == "/status":
@@ -266,6 +285,7 @@ class TelegramBot:
         
         site = args[0].lower().strip()
         success, message = self.router_controller.block_site(site)
+        cmd_logger.info(f"BLOCK site={site} success={success} msg={message}")
         self.send_message(message)
     
     def _cmd_unblock(self, args: list):
@@ -280,6 +300,7 @@ class TelegramBot:
         
         site = args[0].lower().strip()
         success, message = self.router_controller.unblock_site(site)
+        cmd_logger.info(f"UNBLOCK site={site} success={success} msg={message}")
         self.send_message(message)
     
     def _cmd_blocklist(self):
@@ -318,6 +339,7 @@ class TelegramBot:
         
         device = " ".join(args)
         success, message = self.router_controller.kick_device(device)
+        cmd_logger.info(f"KICK device={device} success={success} msg={message}")
         self.send_message(message)
     
     def _cmd_allow(self, args: list):
@@ -332,6 +354,7 @@ class TelegramBot:
         
         device = " ".join(args)
         success, message = self.router_controller.allow_device(device)
+        cmd_logger.info(f"ALLOW device={device} success={success} msg={message}")
         self.send_message(message)
     
     def _cmd_banned(self):
@@ -370,6 +393,7 @@ class TelegramBot:
         
         action = args[0].lower()
         
+        cmd_logger.info(f"WIFI action={action}")
         # Archer C80 Access Points - MAC addresses
         archer_aps = [
             ('AP1', '60:83:E7:B5:66:22'),
@@ -396,6 +420,7 @@ class TelegramBot:
                 results.append(f"{status} {name}")
             
             msg = "📶 <b>WiFi is now ON</b>\n\n" + "\n".join(results)
+        cmd_logger.info(f"WIFI result: {results}")
         
         self.send_message(msg)
 
@@ -411,6 +436,7 @@ class TelegramBot:
         
         action = args[0].lower()
         
+        cmd_logger.info(f"LOCKDOWN action={action}")
         # Protected MAC - never block
         PROTECTED_MAC = '3C:07:54:72:71:1A'
         
@@ -448,8 +474,10 @@ class TelegramBot:
                 
                 msg = f"🔒 <b>LOCKDOWN ACTIVE</b>\n\n{len(blocked)} devices blocked\n🛡️ Homelab protected"
                 self.send_message(msg)
+                cmd_logger.info(f"LOCKDOWN ON success=True blocked={len(blocked)}")
             except Exception as e:
                 self.send_message(f"❌ Lockdown failed: {e}")
+                cmd_logger.error(f"LOCKDOWN ON failed: {e}")
         
         else:  # off
             self.send_message("🔓 Lifting lockdown...")
@@ -457,8 +485,10 @@ class TelegramBot:
                 post_data = {"enable": "true", "allowall": "true"}
                 rc.session.post(f"{rc.url}/api/v1/macfilter", data=post_data, timeout=10)
                 self.send_message("🔓 <b>LOCKDOWN LIFTED</b>\n\nAll devices unblocked")
+                cmd_logger.info(f"LOCKDOWN OFF success=True")
             except Exception as e:
                 self.send_message(f"❌ Failed to lift lockdown: {e}")
+                cmd_logger.error(f"LOCKDOWN OFF failed: {e}")
 
     # ==================== HELPER METHODS ====================
     
