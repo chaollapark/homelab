@@ -57,6 +57,10 @@ def print_help():
   \033[1;32mrouter status\033[0m               Show router connection status
   \033[1;32mrouter blocked\033[0m              Show all blocked sites AND devices
 
+\033[1mWIFI CONTROL:\033[0m
+  \033[1;32mrouter wifi off\033[0m             Turn OFF all WiFi (blocks Archer APs)
+  \033[1;32mrouter wifi on\033[0m              Turn ON all WiFi (unblocks Archer APs)
+
 \033[1mEXAMPLES:\033[0m
   router kick samsung          # Kick device with 'samsung' in name
   router allow manik           # Allow Manik's device back
@@ -377,10 +381,143 @@ def main():
         success = cmd_status()
         return 0 if success else 1
     
+    elif command == 'wifi':
+        action = args[0] if args else None
+        success = cmd_wifi(action)
+        return 0 if success else 1
+    
     else:
         print(f"\033[1;31m✗ Unknown command: {command}\033[0m")
         print("Run 'router --help' for usage.")
         return 1
+
+
+# Archer C80 Access Points - MAC addresses
+ARCHER_APS = [
+    ('AP1', '60:83:E7:B5:66:22'),
+    ('AP2', '60:83:E7:B5:67:5D'),
+    ('AP3', '60:83:E7:B5:41:8C'),
+    ('AP4', '20:23:51:21:61:9F'),
+]
+
+
+def cmd_wifi(action, rc=None):
+    """Turn WiFi on/off by blocking/unblocking Archer APs."""
+    if not ROUTER_AVAILABLE:
+        print("\033[1;31m✗ Router control module not available\033[0m")
+        return False
+    
+    if action not in ['on', 'off']:
+        print("\033[1;31m✗ Usage: router wifi on|off\033[0m")
+        return False
+    
+    own_rc = rc is None
+    if own_rc:
+        rc = RouterController()
+    try:
+        if action == 'off':
+            print("\033[1;33m📡 Blocking all Archer WiFi APs...\033[0m\n")
+            for name, mac in ARCHER_APS:
+                success, msg = _block_mac(rc, mac, name)
+                status = "\033[1;32m✓\033[0m" if success else "\033[1;31m✗\033[0m"
+                print(f"  {status} {name} ({mac}): {'Blocked' if success else msg}")
+            print("\n\033[1;31m📵 WiFi is now OFF\033[0m")
+        else:
+            print("\033[1;33m📡 Unblocking all Archer WiFi APs...\033[0m\n")
+            for name, mac in ARCHER_APS:
+                success, msg = _unblock_mac(rc, mac, name)
+                status = "\033[1;32m✓\033[0m" if success else "\033[1;31m✗\033[0m"
+                print(f"  {status} {name} ({mac}): {'Unblocked' if success else msg}")
+            print("\n\033[1;32m📶 WiFi is now ON\033[0m")
+        return True
+    finally:
+        if own_rc:
+            rc.logout()
+
+
+def _block_mac(rc, mac: str, name: str):
+    """Block a device by MAC address directly."""
+    if not rc._ensure_logged_in():
+        return (False, "Not connected")
+    
+    try:
+        resp = rc.session.get(f"{rc.url}/api/v1/macfilter", timeout=10)
+        data = resp.json()
+        
+        if data.get("error") != "ok":
+            return (False, "API error")
+        
+        current = data.get("data", {})
+        macs = current.get("macfilterTbl", [])
+        
+        # Check if already blocked
+        mac_upper = mac.upper().replace('-', ':')
+        for m in macs:
+            if m.get("macaddress", "").upper() == mac_upper:
+                return (True, "Already blocked")
+        
+        # Find next index
+        existing_ids = [int(m.get("__id", 0)) for m in macs if m.get("__id")]
+        next_idx = max(existing_ids) + 1 if existing_ids else 0
+        
+        # Add to blacklist
+        post_data = {
+            "enable": "true",
+            "allowall": "true",
+        }
+        post_data[f"macfilterTbl[{next_idx}][macaddress]"] = mac_upper
+        post_data[f"macfilterTbl[{next_idx}][description]"] = name
+        post_data[f"macfilterTbl[{next_idx}][type]"] = "Block"
+        post_data[f"macfilterTbl[{next_idx}][alwaysblock]"] = "true"
+        
+        resp = rc.session.post(f"{rc.url}/api/v1/macfilter", data=post_data, timeout=10)
+        if resp.json().get("error") == "ok":
+            return (True, "Blocked")
+        return (False, "Failed to block")
+    except Exception as e:
+        return (False, str(e))
+
+
+def _unblock_mac(rc, mac: str, name: str):
+    """Unblock a device by MAC address."""
+    if not rc._ensure_logged_in():
+        return (False, "Not connected")
+    
+    try:
+        resp = rc.session.get(f"{rc.url}/api/v1/macfilter", timeout=10)
+        data = resp.json()
+        
+        if data.get("error") != "ok":
+            return (False, "API error")
+        
+        current = data.get("data", {})
+        macs = current.get("macfilterTbl", [])
+        
+        mac_upper = mac.upper().replace('-', ':')
+        
+        # Find and remove the MAC
+        new_macs = [m for m in macs if m.get("macaddress", "").upper() != mac_upper]
+        
+        if len(new_macs) == len(macs):
+            return (True, "Not blocked")
+        
+        # Rebuild the filter list
+        post_data = {
+            "enable": "true",
+            "allowall": "true",
+        }
+        for idx, m in enumerate(new_macs):
+            post_data[f"macfilterTbl[{idx}][macaddress]"] = m.get("macaddress", "")
+            post_data[f"macfilterTbl[{idx}][description]"] = m.get("description", "")
+            post_data[f"macfilterTbl[{idx}][type]"] = m.get("type", "Block")
+            post_data[f"macfilterTbl[{idx}][alwaysblock]"] = m.get("alwaysblock", "true")
+        
+        resp = rc.session.post(f"{rc.url}/api/v1/macfilter", data=post_data, timeout=10)
+        if resp.json().get("error") == "ok":
+            return (True, "Unblocked")
+        return (False, "Failed to unblock")
+    except Exception as e:
+        return (False, str(e))
 
 
 if __name__ == "__main__":
