@@ -61,6 +61,10 @@ def print_help():
   \033[1;32mrouter wifi off\033[0m             Turn OFF all WiFi (blocks Archer APs)
   \033[1;32mrouter wifi on\033[0m              Turn ON all WiFi (unblocks Archer APs)
 
+\033[1mLOCKDOWN:\033[0m
+  \033[1;32mrouter lockdown on\033[0m          Block ALL devices except this Mac
+  \033[1;32mrouter lockdown off\033[0m         Unblock all devices
+
 \033[1mEXAMPLES:\033[0m
   router kick samsung          # Kick device with 'samsung' in name
   router allow manik           # Allow Manik's device back
@@ -386,6 +390,11 @@ def main():
         success = cmd_wifi(action)
         return 0 if success else 1
     
+    elif command == 'lockdown':
+        action = args[0] if args else None
+        success = cmd_lockdown(action)
+        return 0 if success else 1
+    
     else:
         print(f"\033[1;31m✗ Unknown command: {command}\033[0m")
         print("Run 'router --help' for usage.")
@@ -417,17 +426,17 @@ def cmd_wifi(action, rc=None):
     try:
         if action == 'off':
             print("\033[1;33m📡 Blocking all Archer WiFi APs...\033[0m\n")
-            for name, mac in ARCHER_APS:
-                success, msg = _block_mac(rc, mac, name)
-                status = "\033[1;32m✓\033[0m" if success else "\033[1;31m✗\033[0m"
-                print(f"  {status} {name} ({mac}): {'Blocked' if success else msg}")
+            success, results = _block_all_aps(rc)
+            for name, mac, status, msg in results:
+                icon = "\033[1;32m✓\033[0m" if status else "\033[1;31m✗\033[0m"
+                print(f"  {icon} {name} ({mac}): {msg}")
             print("\n\033[1;31m📵 WiFi is now OFF\033[0m")
         else:
             print("\033[1;33m📡 Unblocking all Archer WiFi APs...\033[0m\n")
-            for name, mac in ARCHER_APS:
-                success, msg = _unblock_mac(rc, mac, name)
-                status = "\033[1;32m✓\033[0m" if success else "\033[1;31m✗\033[0m"
-                print(f"  {status} {name} ({mac}): {'Unblocked' if success else msg}")
+            success, results = _unblock_all_aps(rc)
+            for name, mac, status, msg in results:
+                icon = "\033[1;32m✓\033[0m" if status else "\033[1;31m✗\033[0m"
+                print(f"  {icon} {name} ({mac}): {msg}")
             print("\n\033[1;32m📶 WiFi is now ON\033[0m")
         return True
     finally:
@@ -435,71 +444,85 @@ def cmd_wifi(action, rc=None):
             rc.logout()
 
 
-def _block_mac(rc, mac: str, name: str):
-    """Block a device by MAC address directly."""
+def _block_all_aps(rc):
+    """Block all Archer APs in a single API call."""
     if not rc._ensure_logged_in():
-        return (False, "Not connected")
+        return (False, [(n, m, False, "Not connected") for n, m in ARCHER_APS])
     
     try:
         resp = rc.session.get(f"{rc.url}/api/v1/macfilter", timeout=10)
         data = resp.json()
         
         if data.get("error") != "ok":
-            return (False, "API error")
+            return (False, [(n, m, False, "API error") for n, m in ARCHER_APS])
         
         current = data.get("data", {})
         macs = current.get("macfilterTbl", [])
         
-        # Check if already blocked
-        mac_upper = mac.upper().replace('-', ':')
-        for m in macs:
-            if m.get("macaddress", "").upper() == mac_upper:
-                return (True, "Already blocked")
+        # Get existing blocked MACs
+        existing_macs = {m.get("macaddress", "").upper() for m in macs}
         
-        # Find next index
-        existing_ids = [int(m.get("__id", 0)) for m in macs if m.get("__id")]
-        next_idx = max(existing_ids) + 1 if existing_ids else 0
-        
-        # Add to blacklist
+        # Build post data with all existing + new APs
         post_data = {
             "enable": "true",
             "allowall": "true",
         }
-        post_data[f"macfilterTbl[{next_idx}][macaddress]"] = mac_upper
-        post_data[f"macfilterTbl[{next_idx}][description]"] = name
-        post_data[f"macfilterTbl[{next_idx}][type]"] = "Block"
-        post_data[f"macfilterTbl[{next_idx}][alwaysblock]"] = "true"
         
+        # Keep existing entries
+        idx = 0
+        for m in macs:
+            post_data[f"macfilterTbl[{idx}][macaddress]"] = m.get("macaddress", "")
+            post_data[f"macfilterTbl[{idx}][description]"] = m.get("description", "")
+            post_data[f"macfilterTbl[{idx}][type]"] = m.get("type", "Block")
+            post_data[f"macfilterTbl[{idx}][alwaysblock]"] = m.get("alwaysblock", "true")
+            idx += 1
+        
+        # Add new APs
+        results = []
+        for name, mac in ARCHER_APS:
+            mac_upper = mac.upper().replace('-', ':')
+            if mac_upper in existing_macs:
+                results.append((name, mac, True, "Already blocked"))
+            else:
+                post_data[f"macfilterTbl[{idx}][macaddress]"] = mac_upper
+                post_data[f"macfilterTbl[{idx}][description]"] = name
+                post_data[f"macfilterTbl[{idx}][type]"] = "Block"
+                post_data[f"macfilterTbl[{idx}][alwaysblock]"] = "true"
+                idx += 1
+                results.append((name, mac, True, "Blocked"))
+        
+        # Single API call to block all
         resp = rc.session.post(f"{rc.url}/api/v1/macfilter", data=post_data, timeout=10)
         if resp.json().get("error") == "ok":
-            return (True, "Blocked")
-        return (False, "Failed to block")
+            return (True, results)
+        return (False, [(n, m, False, "API failed") for n, m in ARCHER_APS])
     except Exception as e:
-        return (False, str(e))
+        return (False, [(n, m, False, str(e)) for n, m in ARCHER_APS])
 
 
-def _unblock_mac(rc, mac: str, name: str):
-    """Unblock a device by MAC address."""
+def _unblock_all_aps(rc):
+    """Unblock all Archer APs in a single API call."""
     if not rc._ensure_logged_in():
-        return (False, "Not connected")
+        return (False, [(n, m, False, "Not connected") for n, m in ARCHER_APS])
     
     try:
         resp = rc.session.get(f"{rc.url}/api/v1/macfilter", timeout=10)
         data = resp.json()
         
         if data.get("error") != "ok":
-            return (False, "API error")
+            return (False, [(n, m, False, "API error") for n, m in ARCHER_APS])
         
         current = data.get("data", {})
         macs = current.get("macfilterTbl", [])
         
-        mac_upper = mac.upper().replace('-', ':')
+        # Get AP MACs to remove
+        ap_macs = {mac.upper().replace('-', ':') for name, mac in ARCHER_APS}
         
-        # Find and remove the MAC
-        new_macs = [m for m in macs if m.get("macaddress", "").upper() != mac_upper]
+        # Filter out AP MACs
+        new_macs = [m for m in macs if m.get("macaddress", "").upper() not in ap_macs]
         
-        if len(new_macs) == len(macs):
-            return (True, "Not blocked")
+        # Check which were actually removed
+        removed_macs = {m.get("macaddress", "").upper() for m in macs} - {m.get("macaddress", "").upper() for m in new_macs}
         
         # Rebuild the filter list
         post_data = {
@@ -512,12 +535,113 @@ def _unblock_mac(rc, mac: str, name: str):
             post_data[f"macfilterTbl[{idx}][type]"] = m.get("type", "Block")
             post_data[f"macfilterTbl[{idx}][alwaysblock]"] = m.get("alwaysblock", "true")
         
+        results = []
+        for name, mac in ARCHER_APS:
+            mac_upper = mac.upper().replace('-', ':')
+            if mac_upper in removed_macs:
+                results.append((name, mac, True, "Unblocked"))
+            else:
+                results.append((name, mac, True, "Was not blocked"))
+        
         resp = rc.session.post(f"{rc.url}/api/v1/macfilter", data=post_data, timeout=10)
         if resp.json().get("error") == "ok":
-            return (True, "Unblocked")
-        return (False, "Failed to unblock")
+            return (True, results)
+        return (False, [(n, m, False, "API failed") for n, m in ARCHER_APS])
     except Exception as e:
-        return (False, str(e))
+        return (False, [(n, m, False, str(e)) for n, m in ARCHER_APS])
+
+
+# Protected device - never block this one!
+PROTECTED_MAC = '3C:07:54:72:71:1A'  # madan-macmini53 (homelab)
+
+
+def cmd_lockdown(action):
+    """Lockdown mode - block all devices except protected ones."""
+    if not ROUTER_AVAILABLE:
+        print("\033[1;31m✗ Router control module not available\033[0m")
+        return False
+    
+    if action not in ['on', 'off']:
+        print("\033[1;31m✗ Usage: router lockdown on|off\033[0m")
+        return False
+    
+    rc = RouterController()
+    try:
+        if not rc._ensure_logged_in():
+            print("\033[1;31m✗ Cannot connect to router\033[0m")
+            return False
+        
+        # Get all connected devices
+        resp = rc.session.get(f"{rc.url}/api/v1/host", timeout=10)
+        data = resp.json()
+        
+        if data.get('error') != 'ok':
+            print("\033[1;31m✗ Cannot get device list\033[0m")
+            return False
+        
+        hosts = data.get('data', {}).get('hostTbl', [])
+        
+        if action == 'on':
+            print("\033[1;31m🔒 LOCKDOWN MODE - Blocking all devices...\033[0m\n")
+            
+            # Build block list (all devices except protected)
+            post_data = {
+                "enable": "true",
+                "allowall": "true",
+            }
+            
+            idx = 0
+            blocked = []
+            protected = []
+            
+            for h in hosts:
+                mac = h.get('physaddress', '').upper()
+                name = h.get('hostname', 'Unknown')
+                
+                if mac == PROTECTED_MAC.upper():
+                    protected.append((name, mac))
+                    continue
+                
+                post_data[f"macfilterTbl[{idx}][macaddress]"] = mac
+                post_data[f"macfilterTbl[{idx}][description]"] = f"LOCKDOWN: {name}"
+                post_data[f"macfilterTbl[{idx}][type]"] = "Block"
+                post_data[f"macfilterTbl[{idx}][alwaysblock]"] = "true"
+                idx += 1
+                blocked.append((name, mac))
+            
+            resp = rc.session.post(f"{rc.url}/api/v1/macfilter", data=post_data, timeout=10)
+            
+            if resp.json().get('error') == 'ok':
+                for name, mac in protected:
+                    print(f"  \033[1;32m🛡️\033[0m {name} ({mac}) - PROTECTED")
+                for name, mac in blocked:
+                    print(f"  \033[1;31m🚫\033[0m {name} ({mac}) - BLOCKED")
+                print(f"\n\033[1;31m🔒 LOCKDOWN ACTIVE - {len(blocked)} devices blocked\033[0m")
+                return True
+            else:
+                print("\033[1;31m✗ Failed to apply lockdown\033[0m")
+                return False
+        
+        else:  # action == 'off'
+            print("\033[1;32m🔓 Lifting lockdown - Unblocking all devices...\033[0m\n")
+            
+            # Clear all MAC filters
+            post_data = {
+                "enable": "true",
+                "allowall": "true",
+            }
+            
+            resp = rc.session.post(f"{rc.url}/api/v1/macfilter", data=post_data, timeout=10)
+            
+            if resp.json().get('error') == 'ok':
+                print("\033[1;32m🔓 LOCKDOWN LIFTED - All devices unblocked\033[0m")
+                return True
+            else:
+                print("\033[1;31m✗ Failed to lift lockdown\033[0m")
+                return False
+    
+    finally:
+        rc.logout()
 
 
 if __name__ == "__main__":
