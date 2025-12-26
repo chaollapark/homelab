@@ -129,6 +129,8 @@ class TelegramBot:
             self._cmd_allow(args)
         elif command == "/banned":
             self._cmd_banned()
+        elif command == "/wifi":
+            self._cmd_wifi(args)
     
     # ==================== HELP ====================
     
@@ -149,7 +151,9 @@ class TelegramBot:
             "<b>📵 Device Control:</b>\n"
             "/kick &lt;device&gt; - Kick device off network\n"
             "/allow &lt;device&gt; - Allow device back\n"
-            "/banned - Show banned devices\n\n"
+            "/banned - Show banned devices\n"
+            "/wifi off - Turn OFF all WiFi\n"
+            "/wifi on - Turn ON all WiFi\n\n"
             "/help - Show this help"
         )
         self.send_message(msg)
@@ -349,6 +353,47 @@ class TelegramBot:
         
         self.send_message("\n".join(lines))
     
+    def _cmd_wifi(self, args: list):
+        """Turn WiFi on/off by blocking/unblocking Archer APs."""
+        if not self.router_controller:
+            self.send_message("❌ Router control not available")
+            return
+        
+        if not args or args[0].lower() not in ['on', 'off']:
+            self.send_message("Usage: /wifi on or /wifi off")
+            return
+        
+        action = args[0].lower()
+        
+        # Archer C80 Access Points - MAC addresses
+        archer_aps = [
+            ('AP1', '60:83:E7:B5:66:22'),
+            ('AP2', '60:83:E7:B5:67:5D'),
+            ('AP3', '60:83:E7:B5:41:8C'),
+            ('AP4', '20:23:51:21:61:9F'),
+        ]
+        
+        results = []
+        if action == 'off':
+            self.send_message("📡 Blocking all WiFi APs...")
+            for name, mac in archer_aps:
+                success, msg = self.router_controller.kick_device(mac)
+                status = "✓" if success or "already" in msg.lower() else "✗"
+                results.append(f"{status} {name}")
+            
+            msg = "📵 <b>WiFi is now OFF</b>\n\n" + "\n".join(results)
+            msg += "\n\n<i>APs still broadcast but no internet</i>"
+        else:
+            self.send_message("📡 Unblocking all WiFi APs...")
+            for name, mac in archer_aps:
+                success, msg = self.router_controller.allow_device(mac)
+                status = "✓" if success or "not blocked" in msg.lower() else "✗"
+                results.append(f"{status} {name}")
+            
+            msg = "📶 <b>WiFi is now ON</b>\n\n" + "\n".join(results)
+        
+        self.send_message(msg)
+
     # ==================== HELPER METHODS ====================
     
     def _get_stats(self) -> dict:
