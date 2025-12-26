@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""
+VOO Router API Client
+Connects to VOO Technicolor router using PBKDF2 authentication.
+"""
+
+import requests
+import json
+import hashlib
+import binascii
+import argparse
+import sys
+from pathlib import Path
+
+# Try to import cryptography for PBKDF2
+try:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
+    import hashlib
+import configparser
+
+# Configuration
+CONFIG_DIR = Path.home() / "bin" / "config"
+CONFIG_FILE = CONFIG_DIR / "router.conf"
+
+# Paths
+DATA_DIR = Path.home() / ".local" / "share" / "network-scan"
+NAMES_FILE = DATA_DIR / "device_names.db"
+
+
+def load_config():
+    """Load configuration from router.conf file."""
+    config = configparser.ConfigParser()
+    
+    if not CONFIG_FILE.exists():
+        print(f"Error: Config file not found: {CONFIG_FILE}", file=sys.stderr)
+        print(f"Copy {CONFIG_DIR}/router.conf.example to {CONFIG_FILE} and fill in your credentials.", file=sys.stderr)
+        sys.exit(1)
+    
+    config.read(CONFIG_FILE)
+    
+    return {
+        'url': config.get('router', 'url', fallback='http://192.168.0.1'),
+        'username': config.get('router', 'username', fallback=''),
+        'password': config.get('router', 'password', fallback=''),
+    }
+
+
+# Load config at module level
+CONFIG = load_config()
+
+
+def pbkdf2_hex(password: str, salt: str, iterations: int = 1000, key_length: int = 16) -> str:
+    """
+    Compute PBKDF2 and return hex string (like sjcl.codec.hex.fromBits).
+    salt is a string (the router sends it as a string).
+    """
+    if isinstance(password, str):
+        password = password.encode('utf-8')
+    if isinstance(salt, str):
+        salt = salt.encode('utf-8')
+    
+    if HAS_CRYPTO:
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=key_length,
+            salt=salt,
+            iterations=iterations,
+        )
+        derived = kdf.derive(password)
+    else:
+        # Fallback to hashlib
+        derived = hashlib.pbkdf2_hmac('sha256', password, salt, iterations, dklen=key_length)
+    
+    return derived.hex()
+
+
+class VooRouterAPI:
+    """Client for VOO Technicolor router API."""
+    
+    def __init__(self, router_url=None, username=None, password=None):
+        router_url = router_url or CONFIG['url']
+        username = username or CONFIG['username']
+        password = password or CONFIG['password']
+        self.router_url = router_url.rstrip('/')
+        self.username = username
+        self.password = password
+        self.session = requests.Session()
+        self.csrf_token = None
+        self.logged_in = False
+        
+    def login(self) -> bool:
+        """Authenticate with the router using PBKDF2."""
+        print("[*] Connecting to router...", file=sys.stderr)
+        
+        # Step 0: Initialize session
+        try:
+            resp = self.session.get(f"{self.router_url}/api/v1/session/menu", timeout=10)
+            print(f"[*] Session initialized: {self.session.cookies.get('PHPSESSID', 'N/A')[:8]}...", file=sys.stderr)
+        except requests.RequestException as e:
+            print(f"[!] Error connecting to router: {e}", file=sys.stderr)
+            return False
+        
+        # Step 1: Request salt with "seeksalthash"
+        print("[*] Requesting salt...", file=sys.stderr)
+        try:
+            resp = self.session.post(
+                f"{self.router_url}/api/v1/session/login",
+                data={"username": self.username, "password": "seeksalthash"},
+                timeout=10
+            )
+            data = resp.json()
+            print(f"[*] Salt response: {json.dumps(data)}", file=sys.stderr)
+            
+            if data.get("error") != "ok":
+                print(f"[!] Failed to get salt: {data.get('message')}", file=sys.stderr)
+                return False
+            
+            salt = data.get("salt", "")
+            salt_webui = data.get("saltwebui", "")
+            
+        except requests.RequestException as e:
+            print(f"[!] Error requesting salt: {e}", file=sys.stderr)
+            return False
+        
+        # Step 2: Compute password hash and login
+        if salt == "none":
+            # No hashing needed, send plain password
+            print("[*] No salt, using plain password...", file=sys.stderr)
+            final_password = self.password
+        else:
+            # Double PBKDF2 hashing
+            print(f"[*] Computing PBKDF2 hash (salt={salt[:20]}...)...", file=sys.stderr)
+            hashed1 = pbkdf2_hex(self.password, salt)
+            print(f"[*] First hash: {hashed1[:20]}...", file=sys.stderr)
+            
+            print(f"[*] Computing second PBKDF2 hash (saltwebui={salt_webui[:20]}...)...", file=sys.stderr)
+            final_password = pbkdf2_hex(hashed1, salt_webui)
+            print(f"[*] Final hash: {final_password[:20]}...", file=sys.stderr)
+        
+        # Step 3: Login with computed password
+        print("[*] Logging in...", file=sys.stderr)
+        try:
+            resp = self.session.post(
+                f"{self.router_url}/api/v1/session/login",
+                data={"username": self.username, "password": final_password},
+                timeout=10
+            )
+            data = resp.json()
+            print(f"[*] Login response: {json.dumps(data)}", file=sys.stderr)
+            
+            if data.get("error") == "ok":
+                self.csrf_token = self.session.cookies.get("auth")
+                self.logged_in = True
+                print("[+] Successfully logged in!", file=sys.stderr)
+                return True
+            else:
+                print(f"[!] Login failed: {data.get('message')}", file=sys.stderr)
+                return False
+                
+        except requests.RequestException as e:
+            print(f"[!] Login error: {e}", file=sys.stderr)
+            return False
+    
+    def _api_get(self, endpoint: str):
+        """Make authenticated GET request to API."""
+        headers = {}
+        if self.csrf_token:
+            headers["X-CSRF-TOKEN"] = self.csrf_token
+            
+        try:
+            resp = self.session.get(
+                f"{self.router_url}/api/v1/{endpoint}",
+                headers=headers,
+                timeout=10
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                return None
+        except:
+            return None
+    
+    def discover_endpoints(self) -> list:
+        """Try to discover available API endpoints."""
+        endpoints = [
+            "session/menu",
+            "system/ModelName",
+            "system/info",
+            "network/hosts",
+            "network/lan",
+            "network/lan/dhcp",
+            "network/lan/dhcp/clients",
+            "network/lan/clients",
+            "network/wan",
+            "network/devices",
+            "lan/hosts",
+            "hosts",
+            "devices",
+            "dhcp/clients",
+            "wireless",
+            "wireless/radio",
+            "status",
+        ]
+        
+        found = []
+        for endpoint in endpoints:
+            data = self._api_get(endpoint)
+            if data:
+                found.append({"endpoint": endpoint, "data": data})
+                print(f"  ✓ {endpoint}", file=sys.stderr)
+        
+        return found
+    
+    def get_connected_devices(self):
+        """Fetch list of connected devices."""
+        # Try different possible endpoints
+        endpoints = [
+            "network/hosts",
+            "network/lan/dhcp/clients", 
+            "network/lan/clients",
+            "lan/hosts",
+            "hosts",
+            "devices",
+        ]
+        
+        for endpoint in endpoints:
+            data = self._api_get(endpoint)
+            if data and "data" in data:
+                return data["data"]
+        
+        return None
+    
+    def logout(self):
+        """Logout from router."""
+        if self.logged_in:
+            try:
+                self.session.post(f"{self.router_url}/api/v1/session/logout", timeout=5)
+            except:
+                pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description="VOO Router API Client")
+    parser.add_argument("--discover", action="store_true", help="Discover available API endpoints")
+    parser.add_argument("--devices", action="store_true", help="List connected devices")
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    args = parser.parse_args()
+    
+    if not any([args.discover, args.devices]):
+        args.discover = True  # Default action
+    
+    router = VooRouterAPI()
+    
+    if not router.login():
+        print("[!] Failed to login to router", file=sys.stderr)
+        sys.exit(1)
+    
+    try:
+        if args.discover:
+            print("\n[*] Discovering API endpoints...\n", file=sys.stderr)
+            endpoints = router.discover_endpoints()
+            if args.json:
+                print(json.dumps(endpoints, indent=2))
+            else:
+                for ep in endpoints:
+                    print(f"\n=== {ep['endpoint']} ===")
+                    print(json.dumps(ep['data'], indent=2)[:1000])
+        
+        if args.devices:
+            devices = router.get_connected_devices()
+            if devices:
+                if args.json:
+                    print(json.dumps(devices, indent=2))
+                else:
+                    print("\n📱 Connected Devices:\n")
+                    if isinstance(devices, list):
+                        for d in devices:
+                            print(f"  {d}")
+                    else:
+                        print(json.dumps(devices, indent=2))
+            else:
+                print("[!] Could not fetch device list", file=sys.stderr)
+    
+    finally:
+        router.logout()
+
+
+if __name__ == "__main__":
+    main()

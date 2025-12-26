@@ -152,7 +152,17 @@ class RouterBasedMonitor:
                     if name != mac and device.name == device.mac:
                         self._log(f"📝 Updated name: {device.name} → {name}")
                         device.name = name
-                    
+                        
+                        # If the new name matches notify patterns and device is online,
+                        # send arrival notification (handles MAC randomization case)
+                        if device.should_notify() and is_active:
+                            self._log(f"📱 {device.name} identified on network (MAC randomization detected)")
+                            success = self.notifier.send_phone_arrived(device.name, device.ip)
+                            if success:
+                                self._log("✅ Telegram notification sent")
+                            else:
+                                self._log("❌ Failed to send Telegram notification")
+
                     old_state = device.current_state
                     device.current_state = is_active
                     

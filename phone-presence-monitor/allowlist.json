@@ -1,0 +1,64 @@
+{
+  "devices": [
+    {
+      "name": "This Device (Homelab)",
+      "mac": "3C:07:54:72:71:1A",
+      "reason": "Control device - never block"
+    },
+    {
+      "name": "AP1-Archer",
+      "mac": "60:83:E7:B5:66:22",
+      "reason": "WiFi AP"
+    },
+    {
+      "name": "AP2-Archer",
+      "mac": "60:83:E7:B5:67:5D",
+      "reason": "WiFi AP"
+    },
+    {
+      "name": "AP3-Archer",
+      "mac": "60:83:E7:B5:41:8C",
+      "reason": "WiFi AP"
+    },
+    {
+      "name": "AP4-Archer",
+      "mac": "20:23:51:21:61:9F",
+      "reason": "WiFi AP"
+    },
+    {
+      "name": "My Mac",
+      "mac": "8E:6E:B5:97:0D:32",
+      "reason": "Personal Mac - never block"
+    },
+    {
+      "name": "Samsung",
+      "mac": "6C:70:CB:57:68:56",
+      "reason": "Personal device"
+    },
+    {
+      "name": "realme-12-5G",
+      "mac": "02:C4:2E:90:85:68",
+      "reason": "Personal device"
+    },
+    {
+      "name": "Device-D8D668",
+      "mac": "D8:D6:68:0E:41:18",
+      "reason": "Personal device"
+    },
+    {
+      "name": "TL-SG108E",
+      "mac": "74:FE:CE:6D:58:DB",
+      "reason": "Network switch"
+    },
+    {
+      "name": "Device-E0D362",
+      "mac": "E0:D3:62:98:11:E9",
+      "reason": "Personal device"
+    },
+    {
+      "name": "manik",
+      "mac": "8C:F8:C5:93:24:16",
+      "reason": "Personal device"
+    }
+  ]
+}

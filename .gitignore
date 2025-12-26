@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Config files with secrets
+config.py
+router.conf
+
+# Logs
+logs/
+*.log
+
+# State files
+*.json
+!config.example.json
+!allowlist.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

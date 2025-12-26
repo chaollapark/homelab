@@ -131,6 +131,8 @@ class TelegramBot:
             self._cmd_banned()
         elif command == "/wifi":
             self._cmd_wifi(args)
+        elif command == "/lockdown":
+            self._cmd_lockdown(args)
     
     # ==================== HELP ====================
     
@@ -154,6 +156,9 @@ class TelegramBot:
             "/banned - Show banned devices\n"
             "/wifi off - Turn OFF all WiFi\n"
             "/wifi on - Turn ON all WiFi\n\n"
+            "<b>🔒 Lockdown:</b>\n"
+            "/lockdown on - Block ALL except homelab\n"
+            "/lockdown off - Unblock all devices\n\n"
             "/help - Show this help"
         )
         self.send_message(msg)
@@ -393,6 +398,67 @@ class TelegramBot:
             msg = "📶 <b>WiFi is now ON</b>\n\n" + "\n".join(results)
         
         self.send_message(msg)
+
+    def _cmd_lockdown(self, args: list):
+        """Lockdown mode - block all devices except homelab."""
+        if not self.router_controller:
+            self.send_message("❌ Router control not available")
+            return
+        
+        if not args or args[0].lower() not in ['on', 'off']:
+            self.send_message("Usage: /lockdown on or /lockdown off")
+            return
+        
+        action = args[0].lower()
+        
+        # Protected MAC - never block
+        PROTECTED_MAC = '3C:07:54:72:71:1A'
+        
+        rc = self.router_controller
+        
+        if action == 'on':
+            self.send_message("🔒 Activating lockdown...")
+            
+            # Get all devices
+            try:
+                resp = rc.session.get(f"{rc.url}/api/v1/host", timeout=10)
+                data = resp.json()
+                hosts = data.get('data', {}).get('hostTbl', [])
+                
+                # Build block list
+                post_data = {"enable": "true", "allowall": "true"}
+                idx = 0
+                blocked = []
+                
+                for h in hosts:
+                    mac = h.get('physaddress', '').upper()
+                    name = h.get('hostname', 'Unknown')
+                    
+                    if mac == PROTECTED_MAC.upper():
+                        continue
+                    
+                    post_data[f"macfilterTbl[{idx}][macaddress]"] = mac
+                    post_data[f"macfilterTbl[{idx}][description]"] = f"LOCKDOWN: {name}"
+                    post_data[f"macfilterTbl[{idx}][type]"] = "Block"
+                    post_data[f"macfilterTbl[{idx}][alwaysblock]"] = "true"
+                    idx += 1
+                    blocked.append(name)
+                
+                rc.session.post(f"{rc.url}/api/v1/macfilter", data=post_data, timeout=10)
+                
+                msg = f"🔒 <b>LOCKDOWN ACTIVE</b>\n\n{len(blocked)} devices blocked\n🛡️ Homelab protected"
+                self.send_message(msg)
+            except Exception as e:
+                self.send_message(f"❌ Lockdown failed: {e}")
+        
+        else:  # off
+            self.send_message("🔓 Lifting lockdown...")
+            try:
+                post_data = {"enable": "true", "allowall": "true"}
+                rc.session.post(f"{rc.url}/api/v1/macfilter", data=post_data, timeout=10)
+                self.send_message("🔓 <b>LOCKDOWN LIFTED</b>\n\nAll devices unblocked")
+            except Exception as e:
+                self.send_message(f"❌ Failed to lift lockdown: {e}")
 
     # ==================== HELPER METHODS ====================
     
